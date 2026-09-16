@@ -12,7 +12,7 @@ import SwiftUI
     var body: some View {
         ScrollView {
             VStack(spacing: 20) {
-                BotAvatarMarkView(name: editor.profile.id, appearance: editor.draft.appearance, size: 132)
+                BotAnimatedFaceView(name: editor.profile.id, appearance: editor.draft.appearance, size: 132)
                     .padding(.top, 20)
                     .accessibilityElement(children: .ignore)
                     .accessibilityLabel(selected.localizedName)

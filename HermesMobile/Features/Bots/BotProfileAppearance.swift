@@ -129,12 +129,13 @@ enum BotAvatarExpression: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-/// A static rendering of Desktop's classic shape vocabulary. It never animates,
-/// so inbox scrolling and Reduce Motion behave identically.
+/// One frame of Desktop's classic shape vocabulary. It has no clock of its own:
+/// `BotAnimatedFaceView` supplies the pose, and tile grids draw it at rest.
 struct BotAvatarMarkView: View {
     let name: String
     let appearance: BotProfileAppearance
     let size: CGFloat
+    var pose: BotFacePose = .rest
 
     private var presentation: BotAvatarPresentation {
         BotAvatarPresentation(name: name, appearance: appearance)
@@ -149,8 +150,9 @@ struct BotAvatarMarkView: View {
                 eye(geometry.left)
                 eye(geometry.right)
             }
-            .offset(x: size * 0.12, y: -size * 0.08)
+            .offset(x: size * (0.12 + pose.gazeX), y: size * (-0.08 + pose.gazeY))
         }
+        .rotationEffect(.degrees(pose.roll))
         .frame(width: size, height: size)
         .accessibilityHidden(true)
     }
@@ -159,7 +161,7 @@ struct BotAvatarMarkView: View {
     /// mark's original 0.075 x 0.22 capsule with its 18 degree lean.
     private func eye(_ eye: BotAvatarExpression.Eye) -> some View {
         Capsule().fill(presentation.eyeColor)
-            .frame(width: size * 0.075 * eye.width / 0.186, height: size * 0.22 * eye.height / 0.412)
+            .frame(width: size * 0.075 * eye.width / 0.186, height: size * 0.22 * eye.height / 0.412 * pose.lid)
             .rotationEffect(.degrees(-18 + eye.tilt))
     }
 }
@@ -170,6 +172,8 @@ struct BotAvatarView: View {
     let profile: BotProfile
     let avatar: UIImage?
     let size: CGFloat
+    /// Photos never move; a drawn face blinks unless the caller asks for a frozen frame.
+    var motion: BotFaceMotion = .idle
 
     var body: some View {
         if let avatar {
@@ -177,7 +181,7 @@ struct BotAvatarView: View {
                 .frame(width: size, height: size)
                 .accessibilityHidden(true)
         } else {
-            BotAvatarMarkView(name: profile.id, appearance: BotProfileAppearance(profile: profile), size: size)
+            BotAnimatedFaceView(name: profile.id, appearance: BotProfileAppearance(profile: profile), size: size, motion: motion)
         }
     }
 }
