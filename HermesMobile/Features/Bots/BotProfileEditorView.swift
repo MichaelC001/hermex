@@ -11,14 +11,7 @@ import SwiftUI
     @State private var imageError: String?
     @Environment(\.scenePhase) private var scenePhase
 
-    private let colors = [
-        BotAvatarColor(hex: "#ffffff", name: "White"), BotAvatarColor(hex: "#a9703d", name: "Brown"),
-        BotAvatarColor(hex: "#ef4444", name: "Red"), BotAvatarColor(hex: "#f97316", name: "Orange"),
-        BotAvatarColor(hex: "#f59e0b", name: "Amber"), BotAvatarColor(hex: "#22c55e", name: "Green"),
-        BotAvatarColor(hex: "#14b8a6", name: "Teal"), BotAvatarColor(hex: "#38bdf8", name: "Blue"),
-        BotAvatarColor(hex: "#8b5cf6", name: "Purple"), BotAvatarColor(hex: "#ec4899", name: "Pink"),
-        BotAvatarColor(hex: "#8e8e93", name: "Gray")
-    ]
+    private let colors = BotAvatarColor.palette
 
     init(server: URL, connection: BotConnection, profile: BotProfile, avatar: UIImage?,
          onSaved: @escaping () -> Void = {}) {
@@ -160,7 +153,7 @@ import SwiftUI
                     if let avatar = editor.avatar {
                         Image(uiImage: avatar).resizable().scaledToFit()
                     } else {
-                        BotAnimatedFaceView(name: editor.profile.id, appearance: editor.draft.appearance, size: 96)
+                        BotInteractiveFaceView(name: editor.profile.id, appearance: editor.draft.appearance, size: 96)
                     }
                 }
                 .frame(width: 96, height: 96)
@@ -224,7 +217,7 @@ import SwiftUI
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 6), spacing: 15) {
                 ForEach(colors) { color in
                     Button { editor.setColor(color.hex) } label: {
-                        Circle().fill(Color(botHex: color.hex) ?? .purple).frame(width: 30, height: 30)
+                        Circle().fill(color.swatch).frame(width: 30, height: 30)
                             .overlay { if editor.draft.appearance.color == color.hex { Circle().stroke(.secondary, lineWidth: 3).padding(-5) } }
                             .frame(minWidth: 44, minHeight: 44)
                     }
@@ -387,11 +380,4 @@ import SwiftUI
             } catch { imageError = error.localizedDescription }
         }
     }
-}
-
-private struct BotAvatarColor: Identifiable {
-    let hex: String
-    let name: LocalizedStringResource
-    var id: String { hex }
-    var localizedName: String { String(localized: name) }
 }
