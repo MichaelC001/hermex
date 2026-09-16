@@ -239,6 +239,53 @@ import XCTest
         XCTAssertNotEqual(first.connection.id, second.connection.id)
     }
 
+    func testExpressionRoundTripsThroughTheLookMergeAndClearsOnReset() async throws {
+        let profile = self.profile(look: ["expression": .string("happy"), "sectionId": .string("desktop-section")], revision: 1)
+        let (editor, wire, _) = try makeEditor(profile: profile, details: details())
+        await editor.load()
+        XCTAssertEqual(editor.draft.appearance.expression, "happy")
+
+        editor.setExpression(.curious)
+        XCTAssertEqual(editor.dirtyFields, [.appearance], "an expression never touches the photo")
+        XCTAssertFalse(editor.draft.appearance.custom, "the default look is not claimed as custom")
+        var sent: [String: BotJSON]?
+        wire.configure = { params in
+            sent = params["ui_meta"]?["hermes-bots"].fields
+            return .object(["ok": .bool(true), "applied": .object(["ui_meta": .bool(true)])])
+        }
+        await editor.save()
+        XCTAssertEqual(sent?["expression"], .string("curious"))
+        XCTAssertEqual(sent?["sectionId"], .string("desktop-section"))
+
+        editor.setExpression(.neutral)
+        XCTAssertNil(editor.draft.appearance.expression, "neutral is the absence of the key")
+        editor.setExpression(.sleepy)
+        editor.resetAppearance()
+        XCTAssertNil(editor.draft.appearance.expression)
+    }
+
+    func testExpressionKeepsAnUploadedPhoto() async throws {
+        let connection = connection(name: "Mac")
+        let store = BotConnectionStore(keychain: InMemoryKeychainStore())
+        try store.save(connection, server: server)
+        let photo = UIGraphicsImageRenderer(size: CGSize(width: 8, height: 8)).image { _ in }
+        let editor = BotProfileEditor(server: server, connection: connection, profile: profile(), avatar: photo,
+                                      store: store, avatarStore: BotAvatarStore(), makeWire: { _ in BotProfileEditorWire(details: self.details()) })
+        await editor.load()
+
+        editor.setExpression(.happy)
+
+        XCTAssertNotNil(editor.avatar)
+        XCTAssertFalse(editor.dirtyFields.contains(.avatar))
+    }
+
+    func testUnknownStoredExpressionReadsAsNeutral() {
+        XCTAssertEqual(BotAvatarExpression.resolve(nil), .neutral)
+        XCTAssertEqual(BotAvatarExpression.resolve("grumpy"), .neutral)
+        XCTAssertEqual(BotAvatarExpression.resolve("sleepy"), .sleepy)
+        XCTAssertEqual(BotAvatarExpression.allCases.count, 16)
+    }
+
     func testReloadingAConflictRefetchesOnlyThisBotsAvatar() async throws {
         let avatars = BotAvatarStore()
         let connection = connection(name: "Mac")
