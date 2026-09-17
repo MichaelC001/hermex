@@ -7,7 +7,48 @@ import XCTest
 @testable import HermesMobile
 
 @MainActor final class BotChatPresentationTests: XCTestCase {
-    func testRoomViewerShowsMemberMessagesWithoutComposer() async throws {
+    func testRoomMentionPanelUsesRoomRoster() async throws {
+        let names = ["chief-of-staff", "inbox-triage"]
+        let roster = try names.enumerated().map { index, name in
+            try XCTUnwrap(BotProfile(.object([
+                "name": .string(name),
+                "ui_meta": .object(["hermes-bots": .object([
+                    "shape": .string(index == 0 ? "circle" : "triangle"),
+                    "color": .string(index == 0 ? "#f97316" : "#22c55e")
+                ])])
+            ])))
+        }
+        var value = try XCTUnwrap(RoomFixture.room(latest: 0).fields)
+        value["members"] = .array(names.enumerated().map { index, name in
+            .object(["member_id": .string("member-\(index)"), "profile": .string(name),
+                     "handle": .string(name), "display_name": .string(name)])
+        })
+        let room = try XCTUnwrap(BotGroupRoom(.object(value)))
+        let completions = BotRoomMentions.completions(room: room, query: "")
+        var selected: String?
+        let window = try show(VStack(spacing: 24) {
+            HStack {
+                BotRoomAvatars(room: room, roster: roster, avatars: [:], size: 30)
+                Text(verbatim: room.name)
+            }
+            BotMentionAutocompleteView(completions: completions, avatars: [:], room: room, roster: roster) {
+                selected = $0.tag
+            }
+        }.padding())
+        window.overrideUserInterfaceStyle = .dark
+        defer { close(window) }
+        await renderFrames(8)
+        let text = try screenshot(window, name: "527-room-mention-avatars") { image in
+            XCTAssertEqual(Self.roomAvatarColorBands(image), [
+                ["orange", "green"], ["orange"], ["green"], ["orange", "green"], ["orange", "green"]
+            ], "Header and broadcast rows show both avatars; each member row shows only its own")
+        }
+        XCTAssertTrue(text.contains("@all"), text)
+        XCTAssertTrue(text.contains("@everyone"), text)
+        XCTAssertNil(selected, "Rendering suggestions must not insert a mention")
+    }
+
+    func testRoomShowsMemberMessagesAndTextOnlyComposer() async throws {
         let server = URL(string: "https://room.example")!
         let connection = BotConnection(id: UUID(), name: "Fixture", address: server, username: "fixture", password: "fixture")
         let wire = RoomWire(); wire.latest = 3; wire.kind = "message.member"
@@ -20,11 +61,21 @@ import XCTest
         defer { reader.close(); close(window) }
         await reader.open()
         await renderFrames(8)
-        let text = try screenshot(window, name: "486-room-viewer")
+        let text = try await screenshot(window, name: "527-room-participant", awaiting: ["Comms", "Message Comms"])
         XCTAssertTrue(text.contains("Comms"), text)
         XCTAssertTrue(text.contains("chief-of-staff"), text)
         XCTAssertTrue(text.contains("Message 3"), text)
-        XCTAssertFalse(descendants(window).contains { $0 is UITextView || $0 is UITextField }, "Viewer has no composer")
+        XCTAssertTrue(descendants(window).contains { $0 is UITextView }, "Participant has the shared text editor")
+        XCTAssertTrue(text.contains("Message Comms"), text)
+        wire.driverStatus = RoomFixture.status(running: 1, actions: [RoomFixture.approval])
+        await reader.poll()
+        await renderFrames(8)
+        let approval = try screenshot(window, name: "527-room-approval")
+        XCTAssertTrue(approval.contains("Approval required"), approval)
+        await reader.stop()
+        await renderFrames(8)
+        let stopping = try screenshot(window, name: "527-room-stopping")
+        XCTAssertTrue(stopping.contains("Stopping"), stopping)
     }
 
     func testLocalBotSearchShowsBotNamesAndNeverResumesWhileBrowsing() async throws {
@@ -627,6 +678,47 @@ import XCTest
         XCTAssertTrue(hidden.contains("Plan"), "work progress stays visible with cards off: " + hidden)
     }
 
+    /// Finds the fixture's saturated avatar colors by row, without depending on
+    /// glyph pixels or exact screen coordinates. Short glass reflections are
+    /// excluded; full-height color bands identify each header or suggestion.
+    private static func roomAvatarColorBands(_ image: UIImage) -> [[String]] {
+        guard let cgImage = image.cgImage else { return [] }
+        let width = cgImage.width, height = cgImage.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let drawn = pixels.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(data: bytes.baseAddress, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue) else { return false }
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard drawn else { return [] }
+        var bands: [[String]] = []
+        var colors = Set<String>()
+        var bandHeight = 0
+        let minimumHeight = Int(12 * image.scale)
+        for y in 0..<height {
+            var orange = 0, green = 0
+            for x in 0..<width {
+                let offset = (y * width + x) * 4
+                let red = pixels[offset], g = pixels[offset + 1], blue = pixels[offset + 2]
+                if red > 180, g > 90, g < 145, blue < 90 { orange += 1 }
+                if red < 100, g > 130, blue < 150 { green += 1 }
+            }
+            if orange > 3 || green > 3 {
+                bandHeight += 1
+                if orange > 3 { colors.insert("orange") }
+                if green > 3 { colors.insert("green") }
+            } else if !colors.isEmpty {
+                if bandHeight >= minimumHeight { bands.append(["orange", "green"].filter(colors.contains)) }
+                colors.removeAll()
+                bandHeight = 0
+            }
+        }
+        if bandHeight >= minimumHeight { bands.append(["orange", "green"].filter(colors.contains)) }
+        return bands
+    }
+
     private func show<V: View>(_ view: V) throws -> UIWindow {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
@@ -679,10 +771,11 @@ import XCTest
     }
 
     @discardableResult
-    private func screenshot(_ window: UIWindow, name: String) throws -> String {
+    private func screenshot(_ window: UIWindow, name: String, inspecting: ((UIImage) -> Void)? = nil) throws -> String {
         let image = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
             window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
         }
+        inspecting?(image)
         let attachment = XCTAttachment(image: image)
         attachment.name = name
         attachment.lifetime = .keepAlways
