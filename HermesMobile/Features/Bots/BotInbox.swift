@@ -17,6 +17,40 @@ import UIKit
         var hidden: [BotProfile] = []
     }
 
+    enum ChatRow: Identifiable {
+        case bot(BotProfile)
+        case room(BotGroupRoom)
+
+        var id: String {
+            switch self {
+            case .bot(let profile): return "bot:" + profile.id
+            case .room(let room): return "room:" + room.id
+            }
+        }
+
+        var activity: Date? {
+            switch self {
+            case .bot(let profile): return profile.lastActive
+            case .room(let room): return room.updatedAt
+            }
+        }
+    }
+
+    /// Pinned tiles stay separate; all other visible chats share one timeline.
+    var chats: [ChatRow] {
+        let rows = rows(matching: "")
+        let bots = (rows.others + rows.hidden).map(ChatRow.bot)
+        let groups = roomCapabilities.enabled ? rooms.map(ChatRow.room) : []
+        return (bots + groups).sorted {
+            switch ($0.activity, $1.activity) {
+            case let (lhs?, rhs?) where lhs != rhs: return lhs > rhs
+            case (_?, nil): return true
+            case (nil, _?): return false
+            default: return $0.id < $1.id
+            }
+        }
+    }
+
     let server: URL
     private(set) var connection: BotConnection?
     private(set) var profiles: [BotProfile] = []
@@ -289,6 +323,20 @@ import UIKit
     func rooms(matching query: String) -> [BotGroupRoom] {
         guard roomCapabilities.enabled else { return [] }
         return rooms.filter { query.isEmpty || $0.name.localizedStandardContains(query) }
+    }
+
+    func updateRoom(_ room: BotGroupRoom, connectionID: UUID) {
+        guard connection?.id == connectionID else { return }
+        if let index = rooms.firstIndex(where: { $0.id == room.id }) { rooms[index] = room }
+        else { rooms.insert(room, at: 0) }
+    }
+    func removeRoom(_ key: BotRoomKey) {
+        guard key.server == server, key.connectionID == connection?.id else { return }
+        rooms.removeAll { $0.id == key.roomID }
+    }
+    func reconcileRooms(_ values: [BotGroupRoom], connectionID: UUID) {
+        guard connection?.id == connectionID else { return }
+        rooms = values
     }
 
     func expireRoom(_ key: BotRoomKey) {

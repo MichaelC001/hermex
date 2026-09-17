@@ -11,6 +11,8 @@ import SwiftUI
     @State private var revision = UUID()
     @State private var editSelection: BotProfileEditSelection?
     @State private var creation: BotCreationIntent?
+    @State private var roomCreator: BotRoomCreator?
+    @State private var createdRoom: BotRoomKey?
     @State private var deleting: BotProfile?
     /// The bot whose chat is open. One destination serves the hero tiles and the
     /// rows, so a row shows no disclosure accessory and tiles sharing a row keep
@@ -64,11 +66,18 @@ import SwiftUI
                     .padding(.vertical, 20)
                     .listRowSeparator(.hidden)
                 }
-                ForEach(rows.others) { profile in
-                    row(profile, dimmed: false)
-                }
-                ForEach(rows.hidden) { profile in
-                    row(profile, dimmed: true)
+                ForEach(inbox.chats) { chat in
+                    switch chat {
+                    case .bot(let profile):
+                        row(profile, dimmed: profile.hidden)
+                    case .room(let room):
+                        if let key = inbox.roomKey(room) {
+                            Button { openRoom = key } label: {
+                                BotRoomInboxRow(room: room, roster: inbox.profiles, avatars: inbox.avatars)
+                            }
+                            .id(key).buttonStyle(.plain).listRowSeparator(.hidden)
+                        }
+                    }
                 }
                 if inbox.hiddenCount > 0 {
                     Button(inbox.showsHidden ? "Hide hidden bots" : "Show hidden bots (\(inbox.hiddenCount))") {
@@ -76,18 +85,6 @@ import SwiftUI
                     }
                     .font(.subheadline).foregroundStyle(.secondary)
                     .listRowSeparator(.hidden)
-                }
-                if !inbox.rooms.isEmpty && inbox.roomCapabilities.enabled {
-                    Section("Groups") {
-                        ForEach(inbox.rooms, id: \.id) { room in
-                            if let key = inbox.roomKey(room) {
-                                Button { openRoom = key } label: {
-                                    BotRoomInboxRow(room: room, roster: inbox.profiles, avatars: inbox.avatars)
-                                }
-                                .id(key).buttonStyle(.plain).listRowSeparator(.hidden)
-                            }
-                        }
-                    }
                 }
             } else {
                 ContentUnavailableView("Connect to Hermes", systemImage: "bubble.left.and.bubble.right",
@@ -115,12 +112,32 @@ import SwiftUI
                     .disabled(inbox.connection == nil)
             }
             ToolbarItem(placement: .topBarTrailing) {
-                Button("New bot", systemImage: "plus") { creation = .new }
-                    .disabled(inbox.link != .live)
+                Menu {
+                    Button("New Bot", systemImage: "plus.bubble") { creation = .new }
+                    Button("New Group Chat", systemImage: "person.2") {
+                        guard let connection = inbox.connection else { return }
+                        roomCreator = BotRoomCreator(server: server, connection: connection, roster: inbox.profiles,
+                            onReconciled: { inbox.reconcileRooms($0, connectionID: connection.id) })
+                    }
+                    .disabled(!inbox.roomCapabilities.enabled || !inbox.roomCapabilities.methods.contains("groups.create"))
+                } label: { Label("New chat", systemImage: "plus") }
+                .disabled(inbox.link != .live)
             }
             if #available(iOS 26, *) { ToolbarSpacer(.fixed, placement: .topBarTrailing) }
             ToolbarItem(placement: .topBarTrailing) {
                 Button("Bot connection", systemImage: "gearshape") { showingSetup = true }
+            }
+        }
+        .sheet(isPresented: Binding(get: { roomCreator != nil }, set: { if !$0 { roomCreator = nil } }), onDismiss: {
+            if let key = createdRoom, key.connectionID == inbox.connection?.id { openRoom = key }
+            createdRoom = nil
+        }) {
+            if let creator = roomCreator {
+                BotRoomCreateView(creator: creator, avatars: inbox.avatars) { room in
+                    guard inbox.connection?.id == creator.connection.id else { return }
+                    inbox.updateRoom(room, connectionID: creator.connection.id)
+                    createdRoom = inbox.roomKey(room)
+                }
             }
         }
         .sheet(item: $creation) { intent in
@@ -153,6 +170,7 @@ import SwiftUI
             openRoom = nil
             editSelection = nil
             creation = nil
+            roomCreator?.suspend(); roomCreator = nil; createdRoom = nil
             deleting = nil
         }
         .sheet(isPresented: $showingSetup, onDismiss: { revision = UUID() }) {
@@ -167,6 +185,8 @@ import SwiftUI
                 BotRoomView(reader: BotRoomReader(key: key, connection: connection, room: room, onExpired: {
                     inbox.expireRoom(key); openRoom = nil
                     expiredRoomToast = String(localized: "This room’s history is no longer available.")
+                }, onChanged: { inbox.updateRoom($0, connectionID: key.connectionID) }, onDisbanded: {
+                    inbox.removeRoom(key); openRoom = nil
                 }), roster: inbox.profiles, avatars: inbox.avatars)
                 .id(key)
             }
