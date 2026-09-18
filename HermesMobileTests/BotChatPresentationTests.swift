@@ -499,6 +499,95 @@ import XCTest
         XCTAssertTrue(wire.calls.allSatisfy { $0.0 != "prompt.submit" && $0.0 != "session.interrupt" })
     }
 
+    /// Typing `/` in a Bot chat opens the panel with this connection's skills.
+    /// Commands stay out: nothing on the phone can run one, so a `/model` row
+    /// would be text the agent only reads literally.
+    ///
+    /// Only the row names are read back. The detail column is right-aligned and
+    /// truncates with the window width, so asserting on it reads differently on
+    /// a narrower runner; ranking and filtering belong to `BotSlashCommandTests`.
+    func testSlashPanelOffersConnectionSkillsAndNeverCommands() async throws {
+        let wire = BotFixtureWire()
+        wire.catalog = .object([
+            "skills": .object([
+                "/write-tests": .object(["origin": .string("bundled")]),
+                "/triage-inbox": .object(["origin": .string("user")])
+            ]),
+            "pairs": .array([
+                .array([.string("/model"), .string("Picks the chat model")]),
+                .array([.string("/write-tests"), .string("Adds focused XCTests")]),
+                .array([.string("/triage-inbox"), .string("Sorts the morning mail")])
+            ]),
+            "canon": .object(["/model": .string("/model")]), "commands": .object([:])
+        ])
+        let model = make(wire)
+        await model.recover()
+        await model.loadSlashCatalog()
+        XCTAssertEqual(model.slashSkills.map(\.name), ["triage-inbox", "write-tests"])
+        let window = try show(BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onShowRequest: {}))
+        defer { model.suspend(); close(window) }
+        await renderFrames()
+        let editor = try XCTUnwrap(descendants(window).compactMap { $0 as? ComposerChipTextView }.first)
+        XCTAssertTrue(editor.becomeFirstResponder())
+        await renderFrames()
+
+        editor.insertText("/")
+        let browsing = try await screenshot(window, name: "551-bot-slash-panel", awaiting: ["triage-inbox", "write-tests"])
+        XCTAssertTrue(browsing.contains("triage-inbox"), browsing)
+        XCTAssertTrue(browsing.contains("write-tests"), browsing)
+        XCTAssertFalse(browsing.contains("Picks"), "A command row would insert text nothing runs")
+
+        window.overrideUserInterfaceStyle = .dark
+        await renderFrames(4)
+        capture(window, name: "551-bot-slash-panel-dark")
+        window.overrideUserInterfaceStyle = .light
+
+        // Past the name the user is writing the skill's argument, so the panel
+        // closes and the accepted name becomes an atomic chip.
+        editor.insertText("triage-inbox yesterday's mail")
+        await renderFrames(4)
+        XCTAssertEqual(model.draft, "/triage-inbox yesterday's mail")
+        capture(window, name: "551-bot-slash-chip")
+        XCTAssertEqual(
+            ComposerChipTokenizer.tokens(in: model.draft, catalog: ComposerChipCatalog(skills: model.slashSkills))
+                .map { (model.draft as NSString).substring(with: $0.range) },
+            ["/triage-inbox"])
+    }
+
+    func testScrolledSlashSkillsStayInsideTheCard() async throws {
+        let suggestions = (0..<30).map {
+            SkillSlashSuggestion(name: "skill-\($0)", category: nil, description: nil)
+        }
+        let window = try show(VStack {
+            Spacer()
+            AdaptiveGlassContainer {
+                BotSlashAutocompleteView(suggestions: suggestions, onSelect: { _ in })
+            }
+            .padding(.horizontal, 16)
+            Spacer()
+        })
+        defer { close(window) }
+        await renderFrames()
+        let scroll = try XCTUnwrap(descendants(window).compactMap { $0 as? UIScrollView }.first)
+        drag(scroll, to: 300)
+        await renderFrames(8)
+
+        let card = scroll.convert(scroll.bounds, to: window)
+        let image = capture(window, name: "551-scrolled-skills-clipped")
+        let request = VNRecognizeTextRequest()
+        try VNImageRequestHandler(cgImage: XCTUnwrap(image.cgImage)).perform([request])
+        let rows = (request.results ?? []).filter {
+            $0.topCandidates(1).first?.string.localizedCaseInsensitiveContains("skill") == true
+        }
+        XCTAssertFalse(rows.isEmpty, "The scrolled panel must still show skill rows")
+        for row in rows {
+            let top = (1 - row.boundingBox.maxY) * window.bounds.height
+            let bottom = (1 - row.boundingBox.minY) * window.bounds.height
+            XCTAssertGreaterThanOrEqual(top, card.minY - 1, "Skill text escaped above the card")
+            XCTAssertLessThanOrEqual(bottom, card.maxY + 1, "Skill text escaped below the card")
+        }
+    }
+
     func testPendingRequestOutranksUncertainStopInStatus() async throws {
         // A Stop whose acknowledgement was lost stays uncertain; if the next snapshot
         // still carries a pending approval, the Desktop instruction must stay visible.
