@@ -869,6 +869,67 @@ import XCTest
         XCTAssertTrue(hidden.contains("Plan"), "work progress stays visible with cards off: " + hidden)
     }
 
+    func testDelegationCompletionCardKeepsTheFullReportInItsSheet() async throws {
+        let report = """
+        [ASYNC DELEGATION BATCH COMPLETE — deleg_fixture]
+
+        Unique full worker result body.
+        """
+        let message = ChatMessage(
+            role: "delegation_completion",
+            content: report,
+            timestamp: nil,
+            messageId: "delivery",
+            displayKind: BotDelegationCompletion.displayKind,
+            displayMetadata: [
+                "delegation_id": .string("deleg_fixture"),
+                "task_count": .number(2),
+                "completed_count": .number(2),
+                "failed_count": .number(0),
+                "duration_seconds": .number(8.48)
+            ]
+        )
+        let completion = try XCTUnwrap(BotDelegationCompletion(message))
+
+        let card = try show(VStack {
+            BotDelegationCompletionCard(completion: completion)
+                .padding(16)
+            Spacer()
+        })
+        card.overrideUserInterfaceStyle = .dark
+        let compact = try screenshot(card, name: "477-delegation-completion-card")
+        XCTAssertTrue(compact.contains("2 workers completed"), compact)
+        XCTAssertTrue(compact.contains("View results"), compact)
+        XCTAssertFalse(compact.contains("Unique full worker result body"), compact)
+        close(card)
+
+        let sheet = try show(BotDelegationResultsSheet(completion: completion))
+        sheet.overrideUserInterfaceStyle = .dark
+        defer { close(sheet) }
+        await renderFrames(8)
+        let expanded = try screenshot(sheet, name: "477-delegation-results-sheet")
+        XCTAssertTrue(expanded.contains("Delegated work"), expanded)
+        XCTAssertTrue(expanded.contains("Unique full worker result body"), expanded)
+        // The toolbar's backing differs by build SDK: the button can surface
+        // as a labeled hosted view, as a bar button item, or as a bare
+        // accessibility node. VoiceOver reads any of them, so accept any.
+        // Like the OCR reads above, wait for the label to land instead of
+        // asserting on the first pass.
+        var labels: [String] = []
+        for _ in 0..<8 {
+            labels = accessibilityLabels(in: sheet)
+            if labels.contains("Copy") { break }
+            await renderFrames(4)
+        }
+        // Some build SDKs never publish the accessibility tree in-process
+        // (no labels anywhere, not even sheet content), so there is nothing
+        // to check the toolbar against. Where the tree is published, the
+        // icon-only action must stay named.
+        try XCTSkipUnless(!labels.isEmpty, "No accessibility tree is published in-process on this toolchain.")
+        XCTAssertTrue(labels.contains("Copy"),
+                      "The icon-only toolbar action must remain named for VoiceOver, found: \(labels)")
+    }
+
     /// Finds the fixture's saturated avatar colors by row, without depending on
     /// glyph pixels or exact screen coordinates. Short glass reflections are
     /// excluded; full-height color bands identify each header or suggestion.
@@ -928,6 +989,44 @@ import XCTest
 
     private func descendants(_ view: UIView) -> [UIView] {
         [view] + view.subviews.flatMap(descendants)
+    }
+
+    /// Every accessibility label exposed under a view: hosted view labels,
+    /// explicit accessibility elements (which need not be views), and the bar
+    /// button items behind a UIKit-backed toolbar.
+    private func accessibilityLabels(in root: UIView) -> [String] {
+        var labels: [String] = []
+        var queue = [root]
+        var seen: Set<ObjectIdentifier> = []
+        while let view = queue.popLast() {
+            guard seen.insert(ObjectIdentifier(view)).inserted else { continue }
+            if let label = view.accessibilityLabel { labels.append(label) }
+            for element in view.accessibilityElements ?? [] {
+                if let elementView = element as? UIView {
+                    queue.append(elementView)
+                } else {
+                    labels += accessibilityLabel(of: element)
+                }
+            }
+            if let bar = view as? UINavigationBar, let top = bar.topItem {
+                labels += (top.leftBarButtonItems ?? []).compactMap(\.accessibilityLabel)
+                labels += (top.rightBarButtonItems ?? []).compactMap(\.accessibilityLabel)
+            }
+            if let toolbar = view as? UIToolbar {
+                labels += (toolbar.items ?? []).compactMap(\.accessibilityLabel)
+            }
+            queue += view.subviews
+        }
+        return labels
+    }
+
+    private func accessibilityLabel(of element: Any?) -> [String] {
+        if let node = element as? UIAccessibilityElement { return node.accessibilityLabel.map { [$0] } ?? [] }
+        if let object = element as? NSObject,
+           let label = object.value(forKey: "accessibilityLabel") as? String {
+            return [label]
+        }
+        return []
     }
 
     /// Moves a SwiftUI scroll view the way a finger would. iOS 27 restores its
