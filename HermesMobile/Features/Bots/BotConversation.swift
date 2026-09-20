@@ -85,6 +85,10 @@ import Observation
     private var generation = 0
     private var turnRevision = 0
     private var turnStartedAt: Double?
+    /// When this phone first saw the current turn, for a host that sends no start time.
+    private var turnObservedAt = Date()
+    /// Whether the last snapshot's interruption was a host error rather than a stop.
+    private var turnFailed = false
     private var snapshotIsBusy: Bool?
     private var snapshotDirty = false
     private var fullSnapshotNeeded = false
@@ -103,11 +107,14 @@ import Observation
     private let historyCache: BotHistoryCache?
     private(set) var historyCacheTask: Task<Void, Never>?
     private let drafts: ChatDraftStore
+    /// Nil outside the chat screen and in tests, so only a visible chat drives ActivityKit.
+    private let liveActivityFeed: BotLiveActivityFeed?
 
     init(server: URL, connection: BotConnection, profile: BotProfile, roster: [BotProfile] = [],
          conversation: String? = nil,
          historyCache: BotHistoryCache? = nil, wire: (any BotTransport)? = nil, drafts: ChatDraftStore? = nil,
          attachmentCopies: any ChatDraftAttachmentStoring = ChatDraftAttachmentStore.shared,
+         liveActivityFeed: BotLiveActivityFeed? = nil,
          reconnectDelay: @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) {
         let resolvedWire = wire ?? BotClient(connection: connection)
         self.server = server; self.connection = connection; self.profile = profile
@@ -118,10 +125,54 @@ import Observation
         self.delegatedWork = BotDelegatedWork(wire: resolvedWire)
         self.historyCache = historyCache
         self.drafts = drafts ?? .shared
+        self.liveActivityFeed = liveActivityFeed
         self.attachments = BotAttachmentDraft(key: .bot(server: server, connectionID: connection.id, profile: profile.id),
                                               drafts: drafts ?? .shared, copies: attachmentCopies)
         self.wire.onEvent = { [weak self] event in self?.observe(event) }
         self.wire.onDisconnect = { [weak self] error in self?.disconnected(error) }
+        self.delegatedWork.onWorkersChanged = { [weak self] in self?.syncLiveActivity() }
+    }
+
+    /// This conversation as its Live Activity should show it (#489). Counts and tool
+    /// names only, plus a reply excerpt the feed drops unless previews are on.
+    var liveActivitySnapshot: BotLiveActivitySnapshot {
+        let phase: BotLiveActivitySnapshot.Phase
+        if connectionState != .connected { phase = .disconnected }
+        else {
+            switch turn {
+            case .running, .stopping, .needsAttention:
+                phase = .working(turn: turnStartedAt.map { String($0) } ?? runtime ?? "",
+                                 startedAt: turnStartedAt.map(Date.init(timeIntervalSince1970:)) ?? turnObservedAt)
+            case .idle: phase = .finished(.complete)
+            case .interrupted: phase = .finished(turnFailed ? .failed : .cancelled)
+            case .unknown, .submitting, .uncertain: phase = .unknown
+            }
+        }
+
+        let work: BotLiveActivitySnapshot.Work
+        let reply = liveMessages.last { $0.role == "assistant" }?.content ?? ""
+        if turn == .needsAttention {
+            if case .approval = pendingRequest { work = .waitingForApproval } else { work = .waitingForAnswer }
+        } else if let tool = liveActivity.toolCalls.last, !tool.isCompleted { work = .tool(tool.name) }
+        else if !reply.isEmpty { work = .responding(AgentRunActivitySanitizer.responseExcerpt(reply)) }
+        else if liveActivity.toolCalls.last != nil { work = .toolDone }
+        else if !liveActivity.reasoning.isEmpty { work = .thinking }
+        else { work = .starting }
+
+        var chips: [String] = []
+        if let plan, !plan.isFinished {
+            chips.append(String(localized: "Plan \(min(plan.completedCount + 1, plan.items.count)) of \(plan.items.count)"))
+        }
+        if delegatedWork.activeCount > 0 { chips.append(String(localized: "\(delegatedWork.activeCount) workers")) }
+        if !liveActivity.toolCalls.isEmpty { chips.append(String(localized: "\(liveActivity.toolCalls.count) tools")) }
+
+        return BotLiveActivitySnapshot(
+            destination: BotDestination(server: server, connectionID: connection.id, profile: profile.id, conversation: root),
+            title: BotProfileAppearance(profile: profile).title, phase: phase, work: work, chips: chips)
+    }
+
+    private func syncLiveActivity() {
+        liveActivityFeed?.sync(liveActivitySnapshot, profile: profile)
     }
 
     var artifactContext: BotArtifactContext? {
@@ -332,6 +383,7 @@ import Observation
             chatControls.snapshot(current["info"], idle: [.idle, .interrupted].contains(turn))
             connectionState = .connected
             shouldRetryConnection = false
+            syncLiveActivity()
             await delegatedWork.connect(.init(connectionID: connection.id, runtime: foundRuntime, generation: owner))
             try check(owner)
             scheduleRefresh()
@@ -417,6 +469,7 @@ import Observation
     }
 
     private func applySnapshot(_ snapshot: BotJSON, full: Bool, settingsRevision: Int? = nil, requestsRevision: Int? = nil) throws {
+        defer { syncLiveActivity() }
         guard snapshot["session_id"].text == runtime, snapshot["session_key"].text == tip,
               let running = snapshot["running"].flag, snapshot["hydrating"].flag != true else { throw BotFailure.unsupported }
         if let value = snapshot["info"]["profile_name"].text, value != profile.id { throw BotFailure.wrongIdentity }
@@ -441,7 +494,7 @@ import Observation
         if let next = BotPlan(snapshot["todo_state"]), next.revision >= (plan?.revision ?? 0) { plan = next }
         let inflight = snapshot["inflight"]
         let startedAt = inflight["started_at"].number ?? snapshot["turn_started_at"].number
-        if startedAt != turnStartedAt { turnRevision += 1; turnStartedAt = startedAt }
+        if startedAt != turnStartedAt { turnRevision += 1; turnStartedAt = startedAt; turnObservedAt = Date() }
         liveMessages = []
         if let text = inflight["user"].text, !text.isEmpty {
             liveMessages.append(ChatMessage(role: "user", content: BotMentions.displayText(text), timestamp: nil, messageId: "live-user"))
@@ -478,7 +531,9 @@ import Observation
         else if uncertainSend || uncertainStop { turn = .uncertain }
         else if localOperation { /* A snapshot cannot acknowledge a local command. */ }
         else if running || continuation || queued { turn = .running }
-        else if inflight["error"] != .null || snapshot["status"].text == "interrupted" { turn = .interrupted }
+        else if inflight["error"] != .null || snapshot["status"].text == "interrupted" {
+            turn = .interrupted; turnFailed = inflight["error"] != .null
+        }
         else { turn = .idle }
         if settingsRevision == nil || settingsRevision == chatControls.snapshotRevision {
             chatControls.snapshot(snapshot["info"], idle: !busy)
@@ -948,6 +1003,7 @@ import Observation
 
     private func observe(_ event: BotJSON) {
         guard connectionState != .disconnected, runtime != nil else { return }
+        defer { syncLiveActivity() }
         if let request = BotServerRequest(event) {
             guard request.sessionID == runtime else { return }
             if serverRequests == nil { serverRequests = [] }
@@ -1079,6 +1135,7 @@ import Observation
         default: shouldRetryConnection = false
         }
         errorMessage = shouldRetryConnection ? nil : failure.localizedDescription
+        syncLiveActivity()
         scheduleReconnect()
     }
 
@@ -1123,5 +1180,6 @@ import Observation
         localOperation = false; submittingPrompt = nil
         streamRequest = nil; serverRequests = nil; answeringRequestID = nil
         connectionState = .disconnected; turn = .unknown
+        syncLiveActivity()
     }
 }
