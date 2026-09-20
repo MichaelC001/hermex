@@ -22,9 +22,24 @@ import SwiftUI
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(spacing: 16) {
+                // Eager: member replies are hosted selection documents, and a lazy
+                // stack places unbuilt rows from an estimate, so the jump to a
+                // search hit missed on a cold open (issue #553). History pages
+                // in through Load earlier, which bounds what this builds.
+                VStack(spacing: 16) {
                     if reader.hasEarlier {
-                        Button("Load earlier") { handleFollowEvent(.userScrollBegin); Task { await reader.loadEarlier() } }
+                        // The new page pushes everything below it down, so bring the
+                        // event the reader was on back to the top afterwards.
+                        Button("Load earlier") {
+                            handleFollowEvent(.userScrollBegin)
+                            let firstShown = reader.events.first?.seq
+                            Task {
+                                await reader.loadEarlier()
+                                guard let firstShown, reader.events.first?.seq != firstShown else { return }
+                                await Task.yield()
+                                proxy.scrollTo(firstShown, anchor: .top)
+                            }
+                        }
                             .disabled(reader.loadingEarlier || reader.link != .live)
                     }
                     if reader.foreignAuthority {
@@ -140,6 +155,7 @@ private struct BotRoomEventView: View {
     let roster: [BotProfile]
     let avatars: [String: UIImage]
     @AppStorage(AppHaptics.isEnabledKey) private var isHapticsEnabled = true
+    @State private var responseIsVisible = false
 
     var body: some View {
         if event.kind == "message.user" {
@@ -151,9 +167,15 @@ private struct BotRoomEventView: View {
                 BotRoomMemberAvatar(member: event.member(in: room), roster: roster, avatars: avatars, size: 26)
                 VStack(alignment: .leading, spacing: 6) {
                     Text(event.sender(in: room)).font(.caption).foregroundStyle(.secondary)
-                    MarkdownRenderer(content: messageText)
+                    ResponseTextSelection(identity: messageText, collectsGlyphs: responseIsVisible) {
+                        MarkdownRenderer(content: messageText)
+                    }
+                    .onGeometryChange(for: Bool.self) { geometry in
+                        guard let viewport = geometry.bounds(of: .scrollView(axis: .vertical)) else { return true }
+                        return viewport.intersects(CGRect(origin: .zero, size: geometry.size))
+                    } action: { responseIsVisible = $0 }
                         .padding(12).background(.fill.tertiary, in: RoundedRectangle(cornerRadius: 20))
-                        .chatMessageContextMenu(actions)
+                        .chatMessageContextMenu(actions, longPress: false)
                 }
                 Spacer(minLength: 20)
             }
