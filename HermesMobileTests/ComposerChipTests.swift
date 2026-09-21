@@ -1,3 +1,4 @@
+import SwiftUI
 import UIKit
 import XCTest
 
@@ -636,6 +637,146 @@ final class ComposerChipGestureTests: XCTestCase {
 
     private func center(of rect: CGRect) -> CGPoint {
         CGPoint(x: rect.midX, y: rect.midY)
+    }
+}
+
+@MainActor
+final class ComposerChipPresentationTests: XCTestCase {
+    func testRedundantPresentationUpdateDoesNotEditTextStorageOrMoveScroll() {
+        let textView = ComposerChipTextView(frame: CGRect(x: 0, y: 0, width: 320, height: 160))
+        textView.applyPresentationStyle(isRightToLeft: false, isDisabled: false)
+        textView.replaceDocument(with: Array(repeating: "A long draft line", count: 30).joined(separator: "\n"))
+        textView.layoutIfNeeded()
+        textView.contentOffset = CGPoint(x: 0, y: 120)
+
+        let editObserver = TextStorageEditObserver()
+        textView.textStorage.delegate = editObserver
+        textView.applyPresentationStyle(isRightToLeft: false, isDisabled: false)
+        textView.layoutIfNeeded()
+
+        XCTAssertEqual(editObserver.processedEditCount, 0)
+        XCTAssertEqual(textView.contentOffset.y, 120, accuracy: 0.001)
+    }
+
+    func testPresentationUpdateStillAppliesChangedDirectionAndDisabledColor() {
+        let textView = ComposerChipTextView()
+
+        textView.applyPresentationStyle(isRightToLeft: true, isDisabled: true)
+
+        XCTAssertEqual(textView.semanticContentAttribute, .forceRightToLeft)
+        XCTAssertEqual(textView.textAlignment, .right)
+        XCTAssertEqual(textView.textColor, .secondaryLabel)
+    }
+
+    func testHostedRedundantUpdateKeepsFocusedManualScrollOffset() async throws {
+        let state = ComposerPresentationHarnessState()
+        let host = UIHostingController(
+            rootView: ComposerPresentationHarness(state: state, updateRevision: 0)
+        )
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+            window.endEditing(true)
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+
+        host.view.layoutIfNeeded()
+        let editor = try XCTUnwrap(descendants(of: host.view).compactMap { $0 as? ComposerChipTextView }.first)
+        XCTAssertTrue(editor.becomeFirstResponder())
+        host.rootView = ComposerPresentationHarness(state: state, updateRevision: 1)
+        await Task.yield()
+        host.view.layoutIfNeeded()
+        editor.layoutIfNeeded()
+        XCTAssertGreaterThan(editor.contentSize.height, editor.bounds.height)
+
+        let manualOffset = CGPoint(x: 0, y: 120)
+        editor.setContentOffset(manualOffset, animated: false)
+        let editObserver = TextStorageEditObserver()
+        editor.textStorage.delegate = editObserver
+
+        host.rootView = ComposerPresentationHarness(state: state, updateRevision: 2)
+        await Task.yield()
+        host.view.layoutIfNeeded()
+
+        let updatedEditor = try XCTUnwrap(
+            descendants(of: host.view).compactMap { $0 as? ComposerChipTextView }.first
+        )
+        XCTAssertTrue(updatedEditor === editor)
+        XCTAssertTrue(updatedEditor.isFirstResponder)
+        XCTAssertEqual(editObserver.processedEditCount, 0)
+        XCTAssertEqual(updatedEditor.contentOffset.y, manualOffset.y, accuracy: 0.001)
+    }
+
+    private func descendants(of view: UIView) -> [UIView] {
+        [view] + view.subviews.flatMap { descendants(of: $0) }
+    }
+}
+
+private final class ComposerPresentationHarnessState {
+    var text = Array(repeating: "A long draft line", count: 30).joined(separator: "\n")
+    var selection: ComposerSelection
+    var isFocused = true
+    var inputHeight: CGFloat = 160
+    var measuredHeight: CGFloat = 160
+
+    init() {
+        selection = ComposerSelection(range: NSRange(location: (text as NSString).length, length: 0))
+    }
+}
+
+private struct ComposerPresentationHarness: View {
+    let state: ComposerPresentationHarnessState
+    let updateRevision: Int
+
+    var body: some View {
+        let _ = updateRevision
+        ComposerTextInputView(
+            text: binding(\ComposerPresentationHarnessState.text),
+            selection: binding(\ComposerPresentationHarnessState.selection),
+            isFocused: binding(\ComposerPresentationHarnessState.isFocused),
+            inputHeight: binding(\ComposerPresentationHarnessState.inputHeight),
+            measuredHeight: binding(\ComposerPresentationHarnessState.measuredHeight),
+            isDisabled: false,
+            isCollapsed: false,
+            isKeyboardSendEnabled: false,
+            verticalPadding: 0,
+            chipSkills: [],
+            chipFilePaths: [],
+            quotes: [],
+            onKeyboardSend: {},
+            onPasteFileProviders: { _ in },
+            onPasteFileURLs: { _ in },
+            onPasteImageProviders: { _ in },
+            onPasteImages: { _ in },
+            onTapChip: { _ in },
+            onTapQuote: { _ in },
+            onRemoveQuote: { _ in }
+        )
+        .frame(width: 350)
+    }
+
+    private func binding<Value>(_ keyPath: ReferenceWritableKeyPath<ComposerPresentationHarnessState, Value>) -> Binding<Value> {
+        Binding(
+            get: { state[keyPath: keyPath] },
+            set: { state[keyPath: keyPath] = $0 }
+        )
+    }
+}
+
+private final class TextStorageEditObserver: NSObject, NSTextStorageDelegate {
+    private(set) var processedEditCount = 0
+
+    func textStorage(
+        _ textStorage: NSTextStorage,
+        didProcessEditing editedMask: NSTextStorage.EditActions,
+        range editedRange: NSRange,
+        changeInLength delta: Int
+    ) {
+        processedEditCount += 1
     }
 }
 
