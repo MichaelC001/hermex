@@ -270,10 +270,6 @@ enum TranscriptTurnClassifier {
         return keysByMessageID
     }
 
-    static func assistantTurnKeysByMessageID(_ messages: [ChatMessage]) -> [String: String] {
-        assistantTurnKeysByAnchorID(messages)
-    }
-
     static func assistantAnchorID(
         forRawIndex rawIndex: Int,
         in messages: [ChatMessage],
@@ -311,10 +307,6 @@ enum TranscriptTurnClassifier {
             guard message.role == "assistant" else { return nil }
             return anchorID(for: message, at: startIndex + offset, messageOffset: messageOffset)
         }
-    }
-
-    static func currentTurnAssistantMessageIDs(in messages: [ChatMessage]) -> [String] {
-        currentTurnAssistantAnchorIDs(in: messages)
     }
 
     private static func previousUserBoundaryIndex(before rawIndex: Int, in messages: [ChatMessage]) -> Int? {
