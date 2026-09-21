@@ -377,12 +377,39 @@ import XCTest
         XCTAssertTrue(expanded.contains("Report.pdf"), expanded)
         XCTAssertFalse(expanded.contains("Photos"), expanded)
         XCTAssertFalse(expanded.contains("Files"), expanded)
-        XCTAssertGreaterThanOrEqual(descendants(window).compactMap { $0 as? UIButton }.filter { $0.menu != nil }.count, 1)
         editor.resignFirstResponder()
         await renderFrames()
         capture(window, name: "478-composer-attachments-collapsed")
         XCTAssertTrue(descendants(window).contains { $0 === editor })
         XCTAssertEqual(model.attachments.items.count, 2)
+    }
+
+    func testAttachmentPickerOverlayRetainsKeyboardFocus() async throws {
+        let model = AttachmentOverlayHarnessModel()
+        let window = try show(AttachmentOverlayHarnessView(model: model))
+        defer { close(window) }
+        await renderFrames()
+
+        let editor = try XCTUnwrap(descendants(window).compactMap { $0 as? UITextField }.first)
+        XCTAssertTrue(editor.becomeFirstResponder())
+        await renderFrames()
+
+        model.isPresented = true
+        await renderFrames()
+        XCTAssertTrue(editor.isFirstResponder, "Opening attachment choices must retain keyboard focus.")
+        let overlay = try XCTUnwrap(descendants(window).first {
+            $0.accessibilityIdentifier == HermexAttachmentPickerPresentation.overlayHostAccessibilityIdentifier
+        })
+        let rootView = try XCTUnwrap(window.rootViewController?.view)
+        XCTAssertTrue(overlay.superview === rootView.superview)
+        XCTAssertFalse(overlay.isDescendant(of: rootView))
+
+        model.isPresented = false
+        await renderFrames()
+        XCTAssertTrue(editor.isFirstResponder, "Closing attachment choices must retain keyboard focus.")
+        XCTAssertFalse(descendants(window).contains {
+            $0.accessibilityIdentifier == HermexAttachmentPickerPresentation.overlayHostAccessibilityIdentifier
+        })
     }
 
     func testFocusedAttachmentSendKeepsRenderingWhileUploadIsPending() async throws {
@@ -1134,6 +1161,36 @@ import XCTest
     var isFocused = false
 }
 
+@MainActor @Observable
+private final class AttachmentOverlayHarnessModel {
+    var isPresented = false
+}
+
+private struct AttachmentOverlayHarnessView: View {
+    @Bindable var model: AttachmentOverlayHarnessModel
+    @State private var message = ""
+
+    var body: some View {
+        VStack {
+            Spacer()
+            TextField("Message", text: $message)
+                .textFieldStyle(.roundedBorder)
+                .padding()
+        }
+        .background {
+            HermexKeyboardRetainingOverlay(isPresented: model.isPresented) {
+                HermexAttachmentPickerView(
+                    imageCapacity: 1,
+                    onChooseFiles: {},
+                    onAdd: { _ in },
+                    onDismiss: { model.isPresented = false }
+                )
+            }
+            .frame(width: 0, height: 0)
+        }
+    }
+}
+
 private struct SessionChatPresentationFixture: View {
     @Bindable var focus: SessionFixtureFocus
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -1180,7 +1237,7 @@ private struct SessionChatPresentationFixture: View {
             onModelPickerOpen: {}, onSelectReasoningEffort: { _ in }, onLoadWorkspaceSuggestions: { _ in },
             onWorkspaceRegistryChanged: {}, onLoadPersonalitySuggestions: {}, onLoadSkillSuggestions: {},
             onSelectWorkspace: { _ in }, onSelectProfile: { _ in }, onHeightChange: { _ in },
-            onPhotoItemSelected: { _ in }, onFileURLsSelected: { _ in }, onPasteFileProviders: { _ in },
+            onPhotoMediaSelected: { _ in }, onFileURLsSelected: { _ in }, onPasteFileProviders: { _ in },
             onPasteFileURLs: { _ in }, onPasteImageProviders: { _ in }, onPasteImages: { _ in },
             onRemoveAttachment: { _ in }, onPreviewAttachment: { _ in }, onDismissUploadAttachmentError: {},
             onSelectFileReference: { _ in }, onOpenFileReference: { _ in }, onSelectGitBranch: { _ in },
