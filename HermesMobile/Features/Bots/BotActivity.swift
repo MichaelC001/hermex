@@ -192,12 +192,17 @@ enum BotTranscriptProjection {
                 flush(anchor: id)
                 let displayKind = row["display_kind"].text
                 let isDelegationCompletion = displayKind == BotDelegationCompletion.displayKind
+                // A persisted steer arrives wrapped in the out-of-band marker.
+                // Unwrap it first so the trailing mention note is still a
+                // suffix and gets hidden like on any other user row.
+                let steerText = role == "user" ? ChatMessage.strippedSteerText(from: text) : nil
+                let userText = steerText ?? text
                 messages.append(ChatMessage(
                     role: isDelegationCompletion ? "delegation_completion" : role,
-                    content: role == "user" && !isDelegationCompletion ? BotMentions.displayText(text) : text,
+                    content: role == "user" && !isDelegationCompletion ? BotMentions.displayText(userText) : text,
                     timestamp: row["timestamp"].number,
                     messageId: id,
-                    displayKind: displayKind,
+                    displayKind: steerText != nil ? ChatMessage.steerDisplayKind : displayKind,
                     displayMetadata: row["display_metadata"].argumentDictionary
                 ))
             default:

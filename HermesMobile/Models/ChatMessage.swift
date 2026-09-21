@@ -17,7 +17,9 @@ struct ChatMessage: Decodable, Equatable, Identifiable {
     let reasoning: String?
     let attachments: [MessageAttachment]?
     /// Display-only server semantics. Direct Bot snapshots use this to keep
-    /// durable system deliveries from impersonating user-authored messages.
+    /// durable system deliveries from impersonating user-authored messages;
+    /// `"steer"` marks a mid-turn steering hint. Unknown values fall back to
+    /// ordinary rendering.
     let displayKind: String?
     let displayMetadata: [String: JSONValue]?
     let turnTps: Double?
@@ -74,6 +76,7 @@ struct ChatMessage: Decodable, Equatable, Identifiable {
         case displayMetadata
         case turnTps = "_turnTps"
         case turnDuration = "_turnDuration"
+        case displayKindSnake = "display_kind"
         case underscoredTimestamp = "_ts"
     }
 
@@ -93,10 +96,63 @@ struct ChatMessage: Decodable, Equatable, Identifiable {
         reasoning = container.decodeLossyStringIfPresent(forKey: .reasoning)
         let decodedAttachments = Self.decodeAttachmentsTolerantly(from: container)
         attachments = Self.attachments(decodedAttachments, enrichedByMarkerIn: content)
+        // Both key spellings: the REST client decodes snake_case, while the
+        // SSE `done` payload's primary path uses a plain decoder.
         displayKind = container.decodeLossyStringIfPresent(forKey: .displayKind)
+            ?? container.decodeLossyStringIfPresent(forKey: .displayKindSnake)
         displayMetadata = try? container.decodeIfPresent([String: JSONValue].self, forKey: .displayMetadata)
         turnTps = container.decodeLossyDoubleIfPresent(forKey: .turnTps)
         turnDuration = container.decodeLossyDoubleIfPresent(forKey: .turnDuration)
+    }
+
+    // MARK: - Steering hints
+
+    /// `display_kind` value the server persists for a mid-turn steering hint.
+    static let steerDisplayKind = "steer"
+
+    /// The exact out-of-band wrapper hermes-agent ≥ 2026.9.11 persists around
+    /// each mid-turn steer. Recognition requires this exact text; a bare
+    /// prefix match would misfire on user text that merely mentions it.
+    private static let steerMarkerOpen = "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at this position; not tool output and not a new delivery when replayed from conversation history]"
+    private static let steerMarkerClose = "[/OUT-OF-BAND USER MESSAGE]"
+
+    /// True for a steering hint: either the server flagged it with
+    /// `display_kind: "steer"`, or the content is exactly the out-of-band
+    /// marker block (older rows, or rows that lost the flag).
+    var isSteerMessage: Bool {
+        displayKind == Self.steerDisplayKind
+            || (role == "user" && Self.isSteerWrappedContent(content))
+    }
+
+    /// The steer text with the out-of-band wrapper stripped. For non-steer
+    /// messages this is the raw content.
+    var steerText: String {
+        Self.strippedSteerText(from: content) ?? content ?? ""
+    }
+
+    /// Strips the `[OUT-OF-BAND USER MESSAGE …] … [/OUT-OF-BAND USER MESSAGE]`
+    /// wrapper hermes-agent ≥ 2026.9.11 persists around each mid-turn steer.
+    /// Returns nil unless the content is exactly a marker-wrapped block: the
+    /// first line is the exact opening marker and the last line is the exact
+    /// closing marker.
+    static func strippedSteerText(from content: String?) -> String? {
+        guard let content else { return nil }
+        let lines = content
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: .newlines)
+        guard lines.count >= 2,
+              lines[0].trimmingCharacters(in: .whitespaces) == Self.steerMarkerOpen,
+              lines[lines.count - 1].trimmingCharacters(in: .whitespaces) == Self.steerMarkerClose
+        else {
+            return nil
+        }
+        return lines[1..<(lines.count - 1)]
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func isSteerWrappedContent(_ content: String?) -> Bool {
+        strippedSteerText(from: content) != nil
     }
 
     private static func attachments(
@@ -229,6 +285,9 @@ enum TranscriptTurnClassifier {
     }
 
     static func isUserTurnBoundary(_ message: ChatMessage) -> Bool {
+        // Steering hints ride along inside the active turn; they never open a
+        // new one.
+        guard !message.isSteerMessage else { return false }
         guard message.role == "user" else { return false }
         return hasVisibleUserContent(message)
     }

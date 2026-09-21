@@ -23,6 +23,9 @@ actor BotHistoryCache {
         var sender: String? = nil
         var memberID: String? = nil
         var timestamp: Double? = nil
+        /// Optional server display hint (e.g. `"steer"`). Absent on snapshots
+        /// saved before steering hints existed; decodes as nil.
+        var displayKind: String? = nil
 
         /// Rebuild only the message projection, never cached commands or runtime state.
         var roomEvent: BotJSON? {
@@ -103,7 +106,7 @@ actor BotHistoryCache {
             guard let role = message.role, ["user", "assistant"].contains(role),
                   let text = message.content, !text.isEmpty,
                   text.utf8.count <= Self.maximumMessageBytes, seen.insert(message.id).inserted else { return nil }
-            return Message(id: message.id, role: role, text: text)
+            return Message(id: message.id, role: role, text: text, displayKind: message.displayKind)
         }
         if let previous = snapshots.first(where: { $0.scope == scope && $0.roomID == nil && $0.profileID == profileID }),
            previous.root == root, previous.tip == tip, previous.messages == rows,
