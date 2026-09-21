@@ -18,7 +18,12 @@ struct BotArtifactMessageView: View {
             if let completion = BotDelegationCompletion(message) {
                 BotDelegationCompletionCard(completion: completion)
             } else if message.role == "user" {
-                MessageBubbleView(message: message, contextMenuActions: actions, textOnly: true)
+                MessageBubbleView(
+                    message: message,
+                    transcriptMediaCacheNamespace: "\(model.server.absoluteString)|bot:\(model.connection.id.uuidString)",
+                    contextMenuActions: actions,
+                    textOnly: true
+                )
             } else if isLive {
                 assistantContent
             } else {
