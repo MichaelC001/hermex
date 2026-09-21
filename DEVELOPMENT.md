@@ -79,7 +79,10 @@ scripts/test-sim <simulator-udid>
 scripts/test-sim <simulator-udid> --only HermesMobileTests/BotLiveActivityTests
 ```
 
-The runner waits for simulator readiness, then holds locks on the simulator
+The runner waits for simulator readiness, terminates any running Hermex app on
+that device (an app left attached by a build-and-run makes the test runner hang
+before connecting, `0 tests executed`; set `HERMEX_BUNDLE_ID` if
+`Config/Local.xcconfig` changes the bundle ID), then holds locks on the simulator
 and checkout until testing finishes. A competing runner reports the current
 owner immediately; different checkout/device pairs run independently. These
 locks coordinate this runner only: keep other build/install tools on their
