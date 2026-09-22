@@ -453,7 +453,9 @@ import XCTest
         XCTAssertTrue(model.attachments.items.isEmpty)
     }
 
-    func testBusyComposerShowsSteerAndRequiresExplicitSendAfterIdle() async throws {
+    /// While the bot works, Send does not write anything: it opens the choice
+    /// card, and the card lists only what the host will take for this draft.
+    func testSendOnAWorkingBotAsksSteerQueueOrInterruptBeforeWriting() async throws {
         let wire = BotFixtureWire(); wire.running = true
         let model = make(wire); await model.recover(); model.editDraft("Focus on reconnect")
         let window = try show(BotChatComposerView(model: model, onStop: {}, onReconnect: {}, onShowRequest: {}))
@@ -461,27 +463,32 @@ import XCTest
         await renderFrames()
         let editor = try XCTUnwrap(descendants(window).compactMap { $0 as? ComposerChipTextView }.first)
         XCTAssertTrue(editor.isKeyboardSendEnabled)
-        // Read the controls at their own scale. In a full-screen capture the
-        // small, secondary-color menu title can be discarded by Vision.
-        let composerBounds = descendants(window).filter { $0 is UIButton || $0 === editor }
-            .map { $0.convert($0.bounds, to: window) }
-            .reduce(CGRect.null) { $0.union($1) }.insetBy(dx: -12, dy: -12)
-        let busy = try screenshot(window, name: "480-busy-steer", croppedTo: composerBounds, literalText: true)
-        XCTAssertTrue(
-            busy.contains("Steer")
-                || accessibilityLabels(in: window).contains("Message action: Steer"),
-            busy
-        )
-        XCTAssertTrue(busy.contains("Focus on reconnect"), busy)
+        XCTAssertFalse(accessibilityLabels(in: window).contains { $0.hasPrefix("Message action") },
+                       "no mode control lives in the toolbar any more")
+
+        // Keyboard send and the arrow button share one path. The card mounts on
+        // the next run loop and fades in, so wait on its rows, not a frame count.
+        editor.onKeyboardSend()
+        // The rendered rows are the check; the overlay host's accessibility tree
+        // is not always materialized on the CI runner, so no label assertion here.
+        let card = try await screenshot(window, name: "busy-send-choices", awaiting: ["Steer", "Queue", "Interrupt"])
+        for choice in ["Steer", "Queue", "Interrupt"] { XCTAssertTrue(card.contains(choice), card) }
+        XCTAssertFalse(wire.calls.contains { ["prompt.submit", "session.steer", "session.redirect"].contains($0.0) })
+        XCTAssertEqual(model.draft, "Focus on reconnect")
+
+        // Idle again: the card is gone and Send is a plain send, still needing a tap.
         wire.running = false
         await model.recover()
-        await renderFrames()
-        XCTAssertFalse(editor.isKeyboardSendEnabled)
-        XCTAssertEqual(model.draft, "Focus on reconnect")
-        // No line explains the switch; the disabled send and the kept draft do.
-        let idle = try screenshot(window, name: "480-idle-explicit-send")
-        XCTAssertFalse(idle.contains("Choose Send"), idle)
+        await renderFrames(8)
+        let idle = try screenshot(window, name: "busy-send-choices-gone")
+        XCTAssertFalse(idle.contains("Interrupt"), idle)
+        XCTAssertTrue(editor.isKeyboardSendEnabled)
         XCTAssertFalse(wire.calls.contains { ["prompt.submit", "session.steer", "session.redirect"].contains($0.0) })
+    }
+
+    func testBusyChoicesDropSteerWhenTheDraftHasAttachments() {
+        XCTAssertEqual(BotPromptMode.busyChoices(hasAttachments: false), [.steer, .queue, .redirect])
+        XCTAssertEqual(BotPromptMode.busyChoices(hasAttachments: true), [.queue, .redirect])
     }
 
     func testTransientDisconnectRemainsQuietAboveComposer() async throws {
@@ -529,7 +536,7 @@ import XCTest
         wire.running = true
         await model.recover()
         await renderFrames()
-        XCTAssertTrue(editor.isKeyboardSendEnabled, "Command-Return uses the visible Steer action while working")
+        XCTAssertTrue(editor.isKeyboardSendEnabled, "Command-Return opens the send-choice card while working")
         XCTAssertTrue(editor.isEditable, "Unsent drafts remain editable while the Bot works")
         XCTAssertTrue(wire.calls.allSatisfy { $0.0 != "prompt.submit" && $0.0 != "session.interrupt" })
     }
