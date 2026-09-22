@@ -1,6 +1,7 @@
 import XCTest
 import AVFoundation
 import ImageIO
+import Observation
 import SwiftData
 import UIKit
 import UniformTypeIdentifiers
@@ -1519,6 +1520,146 @@ final class ChatViewModelSendTests: XCTestCase {
     }
 
     @MainActor
+    func testPendingApprovalRemainsAnswerableAfterChatStreamEnds() async throws {
+        let streamClient = SpySSEStreamingClient()
+        let approvalStreamClient = SpySSEStreamingClient()
+        var responded = false
+        let viewModel = try makeViewModel(
+            streamClient: streamClient,
+            approvalStreamClient: approvalStreamClient
+        ) { request in
+            switch request.url?.path {
+            case "/api/chat/start":
+                return apiTestJSONResponse(#"{"session_id":"session-abc","stream_id":"stream-123"}"#, for: request)
+            case "/api/approval/respond":
+                responded = true
+                return apiTestJSONResponse(#"{"ok":true,"choice":"once"}"#, for: request)
+            case "/api/approval/pending":
+                return apiTestJSONResponse(#"{"pending":null,"pending_count":0}"#, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let didStart = await viewModel.sendMessage("Run setup")
+        XCTAssertTrue(didStart)
+        approvalStreamClient.emit(.approvalPending(ApprovalPendingResponse(
+            pending: PendingApproval(approvalId: "approval-1", command: "make install"),
+            pendingCount: 1
+        )))
+        approvalStreamClient.emit(.approvalPending(ApprovalPendingResponse(pending: nil, pendingCount: nil)))
+        XCTAssertEqual(viewModel.approvalPrompt?.pending.approvalId, "approval-1")
+
+        streamClient.emit(.streamEnd)
+        XCTAssertNil(viewModel.activeStreamID)
+        XCTAssertEqual(viewModel.approvalPrompt?.pending.approvalId, "approval-1")
+        XCTAssertEqual(approvalStreamClient.stopCount, 0)
+
+        let didRespond = await viewModel.respondToApproval(.once)
+        XCTAssertTrue(didRespond)
+        XCTAssertTrue(responded)
+        XCTAssertNil(viewModel.approvalPrompt)
+        XCTAssertEqual(approvalStreamClient.stopCount, 1)
+    }
+
+    @MainActor
+    func testApprovalArrivingAfterChatStreamEndsIsShown() async throws {
+        let streamClient = SpySSEStreamingClient()
+        let approvalStreamClient = SpySSEStreamingClient()
+        let viewModel = try makeViewModel(
+            streamClient: streamClient,
+            approvalStreamClient: approvalStreamClient
+        ) { request in
+            switch request.url?.path {
+            case "/api/chat/start":
+                return apiTestJSONResponse(#"{"session_id":"session-abc","stream_id":"stream-123"}"#, for: request)
+            case "/api/approval/respond":
+                return apiTestJSONResponse(#"{"ok":true,"choice":"once"}"#, for: request)
+            case "/api/approval/pending":
+                return apiTestJSONResponse(#"{"pending":null,"pending_count":0}"#, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let didStart = await viewModel.sendMessage("Run setup")
+        XCTAssertTrue(didStart)
+        streamClient.emit(.streamEnd)
+        XCTAssertNil(viewModel.activeStreamID)
+        XCTAssertEqual(approvalStreamClient.stopCount, 0)
+
+        approvalStreamClient.emit(.approvalPending(ApprovalPendingResponse(pending: nil, pendingCount: 0)))
+        XCTAssertEqual(approvalStreamClient.stopCount, 0)
+
+        approvalStreamClient.emit(.approvalPending(ApprovalPendingResponse(
+            pending: PendingApproval(approvalId: "approval-1", command: "make install"),
+            pendingCount: 1
+        )))
+        XCTAssertEqual(viewModel.approvalPrompt?.pending.approvalId, "approval-1")
+
+        let didRespond = await viewModel.respondToApproval(.once)
+        XCTAssertTrue(didRespond)
+        XCTAssertNil(viewModel.approvalPrompt)
+        XCTAssertEqual(approvalStreamClient.stopCount, 1)
+    }
+
+    @MainActor
+    func testIdleSessionLoadsPendingApprovalAndClearsOnServerUpdate() async throws {
+        let approvalStreamClient = SpySSEStreamingClient()
+        let viewModel = try makeViewModel(approvalStreamClient: approvalStreamClient) { request in
+            switch request.url?.path {
+            case "/api/session/yolo":
+                return apiTestJSONResponse(#"{"ok":true,"yolo_enabled":false}"#, for: request)
+            case "/api/approval/pending":
+                return apiTestJSONResponse(
+                    #"{"pending":{"approval_id":"approval-1","command":"make install"},"pending_count":1}"#,
+                    for: request
+                )
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        await viewModel.refreshApprovalBypassState()
+
+        XCTAssertNil(viewModel.activeStreamID)
+        XCTAssertEqual(viewModel.approvalPrompt?.pending.approvalId, "approval-1")
+        XCTAssertEqual(approvalStreamClient.startedURLs.count, 1)
+
+        approvalStreamClient.emit(.approvalPending(ApprovalPendingResponse(pending: nil, pendingCount: 0)))
+        XCTAssertNil(viewModel.approvalPrompt)
+        XCTAssertEqual(approvalStreamClient.stopCount, 1)
+    }
+
+    @MainActor
+    func testSuspendingChatConnectionKeepsPendingApprovalVisible() async throws {
+        let streamClient = SpySSEStreamingClient()
+        let approvalStreamClient = SpySSEStreamingClient()
+        let viewModel = try makeViewModel(
+            streamClient: streamClient,
+            approvalStreamClient: approvalStreamClient
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/start")
+            return apiTestJSONResponse(#"{"session_id":"session-abc","stream_id":"stream-123"}"#, for: request)
+        }
+
+        let didStart = await viewModel.sendMessage("Run setup")
+        XCTAssertTrue(didStart)
+        approvalStreamClient.emit(.approvalPending(ApprovalPendingResponse(
+            pending: PendingApproval(approvalId: "approval-1", command: "make install"),
+            pendingCount: 1
+        )))
+
+        viewModel.suspendStreamForBackground()
+
+        XCTAssertEqual(viewModel.approvalPrompt?.pending.approvalId, "approval-1")
+        XCTAssertEqual(approvalStreamClient.stopCount, 1)
+    }
+
+    @MainActor
     func testApprovalResponseDoesNotUseSyntheticDisplayIDWhenServerIdentifierMissing() async throws {
         let streamClient = SpySSEStreamingClient()
         let approvalStreamClient = SpySSEStreamingClient()
@@ -1800,6 +1941,57 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertNil(viewModel.sendErrorMessage)
         XCTAssertNil(viewModel.approvalErrorMessage)
 
+        viewModel.cleanupPollingTasks()
+    }
+
+    @MainActor
+    func testApprovalFallbackFindsLateApprovalAfterEmptyIdleProbe() async throws {
+        let streamClient = SpySSEStreamingClient()
+        let approvalStreamClient = SpySSEStreamingClient()
+        let approvalPendingRequests = LockedCounter()
+        let approvalAppeared = expectation(description: "late approval appeared")
+        let pollingIntervals = ChatPollingIntervals(
+            approvalNanoseconds: 10_000_000,
+            clarificationNanoseconds: 100_000_000,
+            backgroundNanoseconds: 100_000_000
+        )
+        let viewModel = try makeViewModel(
+            streamClient: streamClient,
+            approvalStreamClient: approvalStreamClient,
+            pollingIntervals: pollingIntervals
+        ) { request in
+            switch request.url?.path {
+            case "/api/chat/start":
+                return apiTestJSONResponse(#"{"session_id":"session-abc","stream_id":"stream-123"}"#, for: request)
+            case "/api/approval/pending":
+                if approvalPendingRequests.increment() == 1 {
+                    return apiTestJSONResponse(#"{"pending":null,"pending_count":0}"#, for: request)
+                }
+                return apiTestJSONResponse(
+                    #"{"pending":{"approval_id":"approval-1","command":"make install"},"pending_count":1}"#,
+                    for: request
+                )
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let didStart = await viewModel.sendMessage("Run setup")
+        XCTAssertTrue(didStart)
+        streamClient.emit(.streamEnd)
+        XCTAssertNil(viewModel.activeStreamID)
+
+        withObservationTracking {
+            _ = viewModel.approvalPrompt
+        } onChange: {
+            approvalAppeared.fulfill()
+        }
+        approvalStreamClient.emit(.transportError("approval stream failed"))
+        await fulfillment(of: [approvalAppeared], timeout: 2)
+
+        XCTAssertGreaterThanOrEqual(approvalPendingRequests.count, 2)
+        XCTAssertEqual(viewModel.approvalPrompt?.pending.approvalId, "approval-1")
         viewModel.cleanupPollingTasks()
     }
 
@@ -2926,6 +3118,7 @@ final class ChatViewModelSendTests: XCTestCase {
             pendingCount: 1
         )))
         streamClient.emit(.token("Same"))
+        streamClient.emit(.approvalPending(ApprovalPendingResponse(pending: nil, pendingCount: 0)))
 
         let completedSession = try makeSessionDetail("""
         {
