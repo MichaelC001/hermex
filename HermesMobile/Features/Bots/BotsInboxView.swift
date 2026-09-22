@@ -43,8 +43,15 @@ import SwiftUI
                 if let errorMessage = inbox.errorMessage {
                     Text(errorMessage).font(.callout)
                     Button("Reconnect") { revision = UUID() }
-                } else if inbox.link == .connecting && inbox.profiles.isEmpty {
-                    Text("Connecting…")
+                } else if inbox.isLoadingRoster {
+                    // The first row speaks for the set, so VoiceOver hears one
+                    // "Loading bots" instead of nothing.
+                    ForEach(0..<4, id: \.self) { index in
+                        BotInboxSkeletonRow().listRowSeparator(.hidden).padding(.vertical, 12)
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel(Text("Loading bots"))
+                            .accessibilityHidden(index > 0)
+                    }
                 } else if inbox.profiles.isEmpty && inbox.link == .live {
                     Text("No bots yet. Tap + to create one.")
                 }
@@ -386,6 +393,25 @@ private struct BotInboxRow: View {
             }
         }
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// Stand-in for a bot row while the first roster loads: the same avatar and text
+/// footprint, redacted. Static, so it costs nothing on screen.
+private struct BotInboxSkeletonRow: View {
+    var body: some View {
+        HStack(spacing: 14) {
+            Circle().fill(.fill.tertiary).frame(width: 44, height: 44)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(verbatim: "Chief of Staff").font(.headline)
+                    Spacer(minLength: 8)
+                    Text(verbatim: "Saturday").font(.subheadline)
+                }
+                Text(verbatim: "Reading the latest conversation").font(.body)
+            }
+            .redacted(reason: .placeholder)
+        }
     }
 }
 
