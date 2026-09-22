@@ -5,6 +5,50 @@ import Vision
 @testable import HermesMobile
 
 @MainActor final class BotConversationTests: XCTestCase {
+    func testWorkingClockUsesServerTimeAndRestoresItAfterReconnect() async {
+        let wire = BotFixtureWire(); wire.running = true
+        wire.inflight = .object(["started_at": .number(100)])
+        let model = make(wire)
+        XCTAssertNil(model.workingRowStartedAt)
+        await model.recover()
+        XCTAssertEqual(model.workingRowStartedAt, Date(timeIntervalSince1970: 100))
+        model.suspend()
+        XCTAssertNil(model.workingRowStartedAt)
+        await model.recover()
+        XCTAssertEqual(model.workingRowStartedAt, Date(timeIntervalSince1970: 100), "Returning never restarts the clock")
+        wire.attention = true
+        await model.recover()
+        XCTAssertNil(model.workingRowStartedAt, "A blocked turn is waiting, not working")
+        wire.attention = false; wire.running = false
+        await model.recover()
+        XCTAssertNil(model.workingRowStartedAt, "Retained start timestamps do not imply a live turn")
+        model.suspend()
+    }
+
+    func testWorkingClockNeverInventsMissingOrInvalidServerTime() async {
+        let invalidStarts: [Double?] = [nil, 0, -1, .infinity, .nan, Date().addingTimeInterval(600).timeIntervalSince1970]
+        for start in invalidStarts {
+            let wire = BotFixtureWire(); wire.running = true; wire.turnStartedAt = start
+            let model = make(wire); await model.recover()
+            XCTAssertEqual(model.turn, .running)
+            XCTAssertNil(model.workingRowStartedAt)
+            model.suspend()
+        }
+        let wire = BotFixtureWire(); wire.running = true; wire.turnStartedAt = 100
+        let model = make(wire); await model.recover()
+        XCTAssertEqual(model.workingRowStartedAt, Date(timeIntervalSince1970: 100))
+        model.suspend()
+    }
+
+    func testNewTurnWaitsForItsOwnSnapshotBeforeShowingElapsedTime() async {
+        let wire = BotFixtureWire(); wire.running = true; wire.turnStartedAt = 100
+        let model = make(wire); await model.recover()
+        wire.onEvent?(.object(["session_id": .string("runtime"), "seq": .number(1), "type": .string("message.start")]))
+        wire.onEvent?(.object(["session_id": .string("runtime"), "seq": .number(2), "type": .string("message.delta")]))
+        XCTAssertNil(model.workingRowStartedAt, "An event without a timestamp cannot revive the preceding turn's clock")
+        model.suspend()
+    }
+
     func testEmptyRecentTranscriptDoesNotSuppressLoading() async {
         let cache = BotHistoryCache(), identity = connection, wire = BotFixtureWire()
         wire.history = []
@@ -73,6 +117,27 @@ import Vision
         XCTAssertTrue(missing.messages.isEmpty)
         XCTAssertNil(cache.recent.snapshot(for: .bot(server: server, connectionID: identity.id, profile: profile.id)))
         missing.suspend()
+    }
+
+    func testSnapshotInFlightBeforeNewTurnCannotRestoreItsOldClock() async {
+        let wire = BotFixtureWire(); wire.running = true; wire.turnStartedAt = 100
+        let model = make(wire); await model.recover()
+        let applied = expectation(description: "Older full snapshot applied")
+        withObservationTracking { _ = model.messages } onChange: { applied.fulfill() }
+        wire.history = [.object(["role": .string("assistant"), "text": .string("Older snapshot")])]
+        wire.beforeResume = {
+            wire.beforeResume = nil
+            wire.onEvent?(.object(["session_id": .string("runtime"), "seq": .number(2), "type": .string("message.start")]))
+            wire.onEvent?(.object(["session_id": .string("runtime"), "seq": .number(3), "type": .string("message.delta")]))
+        }
+        wire.onEvent?(.object(["session_id": .string("runtime"), "seq": .number(1), "type": .string("message.complete")]))
+        await fulfillment(of: [applied], timeout: 3)
+        XCTAssertNil(model.workingRowStartedAt, "The older reply cannot revive the previous turn's elapsed time")
+        model.suspend()
+        wire.turnStartedAt = 200
+        await model.recover()
+        XCTAssertEqual(model.workingRowStartedAt, Date(timeIntervalSince1970: 200))
+        model.suspend()
     }
 
     private let server = URL(string: "https://webui.example")!

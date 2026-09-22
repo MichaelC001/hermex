@@ -93,6 +93,8 @@ import Observation
     private var generation = 0
     private var turnRevision = 0
     private var turnStartedAt: Double?
+    private var confirmedWorkingStart: Date?
+    private var clockRevision = 0
     /// When this phone first saw the current turn, for a host that sends no start time.
     private var turnObservedAt = Date()
     /// Whether the last snapshot's interruption was a host error rather than a stop.
@@ -161,6 +163,14 @@ import Observation
         historyCache?.recent.remove { $0 == recentKey }
         recentOwner = nil; recentRoot = nil; hasRecentTranscript = false
         if !keepingVisibleHistory { messages = []; settledActivity = []; liveMessages = [] }
+    }
+
+    /// Only a current server snapshot can start the transcript clock. Live Activity's
+    /// legacy local observation fallback is deliberately not used here.
+    var workingRowStartedAt: Date? {
+        guard connectionState == .connected, turn == .running,
+              !uncertainSend, !uncertainStop else { return nil }
+        return confirmedWorkingStart
     }
 
     /// This conversation as its Live Activity should show it (#489). Counts and tool
@@ -431,8 +441,9 @@ import Observation
             let replay = try await request("session.events.since", ["session_id": .string(foundRuntime), "last_seen": .number(Double(sequence))], owner: owner)
             try reconcileReplay(replay, requestsRevision: replayRequestsRevision)
             let requestsRevision = requestRevision
+            let clockRevision = clockRevision
             let current = try await request("session.resume", resumeParams(), owner: owner)
-            try applySnapshot(current, full: true, requestsRevision: requestsRevision)
+            try applySnapshot(current, full: true, requestsRevision: requestsRevision, clockRevision: clockRevision)
             try check(owner)
             let controlsContext = BotChatControls.Context(connectionID: connection.id, profile: profile.id,
                                                           runtime: foundRuntime, generation: owner)
@@ -521,6 +532,8 @@ import Observation
     private func applyActivity(type: String, payload: BotJSON) -> Bool {
         switch type {
         case "message.start":
+            clockRevision += 1
+            confirmedWorkingStart = nil
             liveActivity = BotTurnActivity(); workStatus = nil; streamRequest = nil
             return false
         case "todo.updated":
@@ -534,7 +547,8 @@ import Observation
         return true
     }
 
-    private func applySnapshot(_ snapshot: BotJSON, full: Bool, settingsRevision: Int? = nil, requestsRevision: Int? = nil) throws {
+    private func applySnapshot(_ snapshot: BotJSON, full: Bool, settingsRevision: Int? = nil, requestsRevision: Int? = nil,
+                               clockRevision: Int) throws {
         defer { syncLiveActivity() }
         guard snapshot["session_id"].text == runtime, snapshot["session_key"].text == tip,
               let running = snapshot["running"].flag, snapshot["hydrating"].flag != true else { throw BotFailure.unsupported }
@@ -560,6 +574,10 @@ import Observation
         if let next = BotPlan(snapshot["todo_state"]), next.revision >= (plan?.revision ?? 0) { plan = next }
         let inflight = snapshot["inflight"]
         let startedAt = inflight["started_at"].number ?? snapshot["turn_started_at"].number
+        if clockRevision == self.clockRevision, running, let startedAt, startedAt.isFinite, startedAt > 0,
+           startedAt <= Date().timeIntervalSince1970 {
+            confirmedWorkingStart = Date(timeIntervalSince1970: startedAt)
+        } else { confirmedWorkingStart = nil }
         if startedAt != turnStartedAt { turnRevision += 1; turnStartedAt = startedAt; turnObservedAt = Date() }
         liveMessages = []
         // The host can list the prompt in `messages` while it is still the
@@ -1092,6 +1110,7 @@ import Observation
         }
         guard event["session_id"].text == runtime else { return }
         guard let next = event["seq"].integer, next > 0 else {
+            clockRevision += 1; confirmedWorkingStart = nil
             replayWasReset = true; snapshotDirty = true; fullSnapshotNeeded = true
             turnRevision += 1
             liveActivity = BotTurnActivity(); streamRequest = nil
@@ -1102,6 +1121,7 @@ import Observation
         guard next != sequence else { return }
         let discontinuity = next != sequence + 1
         if discontinuity {
+            clockRevision += 1; confirmedWorkingStart = nil
             replayWasReset = true; fullSnapshotNeeded = true; turnRevision += 1
             // Missed events may hold tool rows, a notice's clear or a stream
             // request's expiry; partial or stale state is worse than none.
@@ -1178,8 +1198,10 @@ import Observation
                     self.fullSnapshotNeeded = false
                     let settingsRevision = self.chatControls.snapshotRevision
                     let requestsRevision = self.requestRevision
+                    let clockRevision = self.clockRevision
                     let reply = try await self.request("session.resume", self.resumeParams(full: full), owner: owner)
-                    try self.applySnapshot(reply, full: full, settingsRevision: settingsRevision, requestsRevision: requestsRevision)
+                    try self.applySnapshot(reply, full: full, settingsRevision: settingsRevision,
+                                           requestsRevision: requestsRevision, clockRevision: clockRevision)
                     if self.snapshotDirty { try await Task.sleep(for: .milliseconds(250)) }
                 }
                 self.refreshTask = nil
@@ -1246,6 +1268,7 @@ import Observation
     }
 
     private func resetConnection() {
+        confirmedWorkingStart = nil
         chatControls.disconnect()
         delegatedWork.disconnect()
         attachmentUploadTask?.cancel(); attachmentUploadTask = nil; isUploadingAttachments = false
