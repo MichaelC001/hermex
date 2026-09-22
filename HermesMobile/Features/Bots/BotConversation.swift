@@ -518,8 +518,19 @@ import Observation
         let startedAt = inflight["started_at"].number ?? snapshot["turn_started_at"].number
         if startedAt != turnStartedAt { turnRevision += 1; turnStartedAt = startedAt; turnObservedAt = Date() }
         liveMessages = []
+        // The host can list the prompt in `messages` while it is still the
+        // in-flight `user`, so the same bubble would draw twice until the turn
+        // settles. The settled row wins when it is this turn's prompt; a same-text
+        // prompt from an earlier turn (dated before this turn began) does not
+        // count, so a repeated message still shows while history lags.
         if let text = inflight["user"].text, !text.isEmpty {
-            liveMessages.append(ChatMessage(role: "user", content: BotMentions.displayText(text), timestamp: nil, messageId: "live-user"))
+            let display = BotMentions.displayText(text)
+            let settled = messages.last
+            let sameText = settled?.role == "user" && settled?.content == display
+            let fromEarlierTurn = startedAt.map { start in (settled?.timestamp ?? start) < start } ?? false
+            if !(sameText && !fromEarlierTurn) {
+                liveMessages.append(ChatMessage(role: "user", content: display, timestamp: nil, messageId: "live-user"))
+            }
         }
         if let text = inflight["assistant"].text, !text.isEmpty {
             liveMessages.append(ChatMessage(role: "assistant", content: text, timestamp: nil, messageId: "live-assistant"))

@@ -605,6 +605,34 @@ import Vision
         return .object(object)
     }
 
+    /// A host that lists the prompt in history while it is still in flight must
+    /// not get a second bubble; the live prompt row only appears when history
+    /// has not caught up.
+    func testInFlightPromptAlreadyInHistoryDrawsOnce() async {
+        let wire = BotFixtureWire(); wire.running = true
+        wire.history = [.object(["role": .string("assistant"), "text": .string("saved")]),
+                        .object(["role": .string("user"), "text": .string("Tell me story")])]
+        wire.inflight = .object(["user": .string("Tell me story"), "assistant": .string("Once")])
+        let model = make(wire); await model.recover()
+        XCTAssertEqual(model.messages.map(\.content), ["saved", "Tell me story"])
+        XCTAssertEqual(model.liveMessages.map(\.content), ["Once"], "the settled row already shows the prompt")
+
+        wire.history = [.object(["role": .string("assistant"), "text": .string("saved")])]
+        await model.recover()
+        XCTAssertEqual(model.liveMessages.map(\.content), ["Tell me story", "Once"], "history behind: the live row fills the gap")
+
+        // The same words sent again: the settled row is last turn's, dated before
+        // this turn began, so the new prompt still shows while history lags.
+        wire.history = [.object(["role": .string("user"), "text": .string("Tell me story"), "timestamp": .number(100)])]
+        wire.turnStartedAt = 200
+        await model.recover()
+        XCTAssertEqual(model.liveMessages.map(\.content), ["Tell me story", "Once"], "an older identical prompt is not this one")
+        wire.history = [.object(["role": .string("user"), "text": .string("Tell me story"), "timestamp": .number(250)])]
+        await model.recover()
+        XCTAssertEqual(model.liveMessages.map(\.content), ["Once"], "dated inside this turn, it is this prompt")
+        model.suspend()
+    }
+
     func testLongResponseInterleavesToolEventsThenSettlesWithoutDuplicateRows() async {
         let wire = BotFixtureWire(); wire.running = true
         let model = make(wire); await model.recover()
@@ -819,6 +847,8 @@ actor BotMemoryDrafts: ChatDraftPersisting {
     var runtimeID = "runtime"
     var running = false
     var inflight = BotJSON.null
+    /// When the current turn began, as `turn_started_at`; nil for a host that sends none.
+    var turnStartedAt: Double?
     var queued = BotJSON.null
     /// Shorthand for "a command approval is blocking this session"; set
     /// `pendingApproval` directly to control the payload.
@@ -886,6 +916,7 @@ actor BotMemoryDrafts: ChatDraftPersisting {
             let snapshot = BotJSON.object([
                 "session_id": .string(runtimeID), "session_key": .string(tip), "running": .bool(running),
                 "messages": .array(history), "inflight": inflight, "queued": queued,
+                "turn_started_at": turnStartedAt.map(BotJSON.number) ?? .null,
                 "pending_approval": pendingApproval ?? (attention ? BotFixtureWire.approval() : .null),
                 "pending_clarify": pendingClarify, "open_requests": openRequests,
                 "todo_state": todoState,
