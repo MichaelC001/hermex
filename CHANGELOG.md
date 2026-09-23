@@ -40,6 +40,8 @@ Security sections per release.
   the profile chip stays inside the composer.
 - Attachment thumbnails are cached per server.
 - Reduce Motion is honored in chat, Git toasts, and onboarding.
+- Interface strings added since 1.6 that showed in English in every language
+  are now translated.
 
 ## [1.6.0] - 2026-09-05
 
