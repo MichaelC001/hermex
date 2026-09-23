@@ -1,6 +1,7 @@
 import ActivityKit
 import Foundation
 import OSLog
+import UIKit
 
 private let liveActivityReconcilerLogger = Logger(
     subsystem: Bundle.main.bundleIdentifier ?? "HermesMobile",
@@ -99,7 +100,10 @@ final class AgentLiveActivityManager: AgentLiveActivityManaging {
     private var pushTokenTask: Task<Void, Never>?
     private var pushStateTask: Task<Void, Never>?
     private var pushOwner: String?
+    private var pushHandoffTask: Task<Void, Never>?
     private var pushRegistrar: PushActivityRegistrar? { PushRegistrar.shared?.activities }
+    /// How long a suspending app waits for the relay to confirm an activity it is handing off.
+    private let pushHandoffLimit: Duration = .seconds(10)
 
     init(minimumUpdateInterval: TimeInterval = 1.5) {
         self.minimumUpdateInterval = minimumUpdateInterval
@@ -120,6 +124,7 @@ final class AgentLiveActivityManager: AgentLiveActivityManaging {
     private func start(sessionID: String, sessionTitle: String, streamID: String?, startedAt: Date, bot: AgentRunActivityBot?) {
         let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedSessionID.isEmpty else { return }
+        cancelPushHandoff()
         let normalizedStreamID = AgentLiveActivityReusePolicy.normalizedStreamID(streamID)
         // A live SSE connection now owns this stream's completion (PR #266 #3).
         activeConnectedStreamID = normalizedStreamID
@@ -259,11 +264,15 @@ final class AgentLiveActivityManager: AgentLiveActivityManaging {
         // stream is eligible for server-truth reconciliation again (PR #266 #3).
         activeConnectedStreamID = nil
         guard currentState?.isFinal == false else { return }
-        if let pushOwner, pushRegistrar?.isRegistered(pushOwner) == true {
-            // Stop queued foreground writes; the relay now owns freshness.
+        if let pushOwner, let registrar = pushRegistrar,
+           let bot = activity?.attributes.bot, canReceivePush(bot) {
+            // Stop queued foreground writes; the relay owns freshness once it confirms.
             pendingUpdateTask?.cancel()
             pendingUpdateTask = nil
-            _ = nextUpdateGeneration()
+            let generation = nextUpdateGeneration()
+            if !registrar.isRegistered(pushOwner) {
+                awaitPushHandoff(owner: pushOwner, registrar: registrar, generation: generation)
+            }
             return
         }
 
@@ -272,11 +281,58 @@ final class AgentLiveActivityManager: AgentLiveActivityManaging {
         }
     }
 
+    /// The live connection dropped while the relay registration was still in flight,
+    /// usually because the user left the app right after sending (#635). Keep the last
+    /// state and stay awake until the registration settles, so a handoff that lands a
+    /// moment later never leaves "Not connected" on a run the relay now drives. Only a
+    /// failed or stalled registration marks the activity stale; any newer write wins.
+    private func awaitPushHandoff(owner: String, registrar: PushActivityRegistrar, generation: Int) {
+        cancelPushHandoff()
+        let lifecycle = lifecycleGeneration
+        var backgroundTask = UIBackgroundTaskIdentifier.invalid
+        let endBackgroundTask = {
+            guard backgroundTask != .invalid else { return }
+            UIApplication.shared.endBackgroundTask(backgroundTask)
+            backgroundTask = .invalid
+        }
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Hermes Live Activity handoff") { [weak self] in
+            // Out of background time: stop waiting, which falls back to the stale state.
+            Task { @MainActor in
+                self?.cancelPushHandoff()
+                endBackgroundTask()
+            }
+        }
+        guard backgroundTask != .invalid else {
+            // No background time to wait in, so the relay cannot confirm before suspension.
+            updateCurrentState { state in AgentRunActivityStateReducer.stale(state: state) }
+            return
+        }
+        // Cancellation ends the wait early; the generation checks below decide whether a
+        // newer write superseded it (no stale write) or background time ran out (write it).
+        pushHandoffTask = Task { [weak self, pushHandoffLimit] in
+            defer { endBackgroundTask() }
+            let registered = await registrar.awaitRegistration(owner, limit: pushHandoffLimit)
+            guard let self, !registered, updateGeneration == generation,
+                  lifecycleGeneration == lifecycle, pushOwner == owner,
+                  let state = currentState, !state.isFinal else { return }
+            var stale = AgentRunActivityStateReducer.stale(state: state)
+            stale.chips = state.chips
+            currentState = stale
+            await sendUpdate(stale, staleDate: staleDate(for: stale), generation: nextUpdateGeneration())
+        }
+    }
+
+    private func cancelPushHandoff() {
+        pushHandoffTask?.cancel()
+        pushHandoffTask = nil
+    }
+
     func end(status: AgentRunActivityStatus, activity activityLine: String, errorSummary: String? = nil) {
         // The run is finalizing — drop the live-connection claim (PR #266 #3).
         activeConnectedStreamID = nil
         guard let currentState else { return }
 
+        cancelPushHandoff()
         pendingUpdateTask?.cancel()
         pendingUpdateTask = nil
 
@@ -653,6 +709,7 @@ final class AgentLiveActivityManager: AgentLiveActivityManaging {
     }
 
     private func reset() {
+        cancelPushHandoff()
         activity = nil
         currentState = nil
         currentSessionID = nil
