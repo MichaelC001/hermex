@@ -477,6 +477,14 @@ extension PushRegistrar: PushPairingEnabling {}
             if desired[owner] == old.desired, pairing(old.desired.server)?.hasSameRegistration(as: old.pairing) == true {
                 guard republish || !old.confirmed else { return }
                 registered[owner]?.confirmed = false
+            } else if desired[owner] == nil, registered.contains(where: { other, record in
+                other != owner && record.desired.server == old.desired.server
+                    && record.desired.sessionID == old.desired.sessionID
+            }) {
+                // A newer activity's PUT, settled while this cleanup waited in line, replaced
+                // the route; a DELETE now would revoke it (#566). A failed PUT leaves no
+                // receipt, so the finished activity's route is still deleted.
+                registered[owner] = nil
             } else {
                 do {
                     try await relay.deleteActivity(sessionID: old.desired.sessionID, deviceToken: old.deviceToken, pairing: old.pairing)
