@@ -292,6 +292,104 @@ final class SessionNavigationStateTests: XCTestCase {
         XCTAssertTrue(events.isEmpty)
     }
 
+    func testActiveRowPollPausesWhileChatCoversCompactList() {
+        let chat = SessionNavigationDestination.session(SessionSummary(sessionId: "streaming"))
+
+        XCTAssertTrue(activeRowMonitorID(isRegularWidth: false, destination: nil).shouldPoll)
+        XCTAssertFalse(activeRowMonitorID(isRegularWidth: false, destination: chat).shouldPoll)
+        XCTAssertFalse(
+            activeRowMonitorID(isRegularWidth: false, destination: .utility(.archived)).shouldPoll
+        )
+        // Scheduled sessions renders live rows, so its badges keep updating.
+        XCTAssertTrue(
+            activeRowMonitorID(isRegularWidth: false, destination: .utility(.scheduled)).shouldPoll
+        )
+        // On regular width the sidebar stays on screen beside the chat.
+        XCTAssertTrue(activeRowMonitorID(isRegularWidth: true, destination: chat).shouldPoll)
+    }
+
+    func testActiveRowPollRestartsWhenReturningToCompactList() {
+        let chat = SessionNavigationDestination.session(SessionSummary(sessionId: "streaming"))
+
+        // A different task ID is what makes SwiftUI restart the paused poll.
+        XCTAssertNotEqual(
+            activeRowMonitorID(isRegularWidth: false, destination: chat),
+            activeRowMonitorID(isRegularWidth: false, destination: nil)
+        )
+        // Selecting another chat on regular width keeps the running poll.
+        XCTAssertEqual(
+            activeRowMonitorID(isRegularWidth: true, destination: chat),
+            activeRowMonitorID(isRegularWidth: true, destination: nil)
+        )
+    }
+
+    func testActiveRowPollStillSkipsIdleAndCachedLists() {
+        XCTAssertFalse(activeRowMonitorID(hasActiveRows: false).shouldPoll)
+        XCTAssertFalse(activeRowMonitorID(isViewingCachedData: true).shouldPoll)
+        XCTAssertEqual(ActiveSessionMonitorTaskID.pollInterval, .seconds(3))
+    }
+
+    @MainActor
+    func testReturnToCompactListTicksOnceAfterReloadingRows() async {
+        var events: [String] = []
+        var streamIDs = ["before-reload"]
+
+        await SessionListReturnRefresh.run(
+            refreshSessions: {
+                events.append("reload")
+                streamIDs = ["after-reload"]
+            },
+            monitorTaskID: {
+                ActiveSessionMonitorTaskID(
+                    streamIDs: streamIDs,
+                    hasActiveRows: true,
+                    isViewingCachedData: false,
+                    isRegularWidth: false,
+                    destination: nil
+                )
+            },
+            refreshActiveRows: { taskID in
+                events.append("tick:\(taskID.streamIDs.joined())")
+            }
+        )
+
+        // The tick runs right away, on the rows the reload found, rather than
+        // leaving stale Approval or Input badges up until the poll's first tick.
+        XCTAssertEqual(events, ["reload", "tick:after-reload"])
+    }
+
+    @MainActor
+    func testReturnSkipsTheTickWhenThePollNeverPaused() async {
+        for monitorID in [
+            activeRowMonitorID(isRegularWidth: true),
+            activeRowMonitorID(hasActiveRows: false),
+            activeRowMonitorID(isViewingCachedData: true),
+        ] {
+            var ticks = 0
+            await SessionListReturnRefresh.run(
+                refreshSessions: {},
+                monitorTaskID: { monitorID },
+                refreshActiveRows: { _ in ticks += 1 }
+            )
+            XCTAssertEqual(ticks, 0)
+        }
+    }
+
+    private func activeRowMonitorID(
+        hasActiveRows: Bool = true,
+        isViewingCachedData: Bool = false,
+        isRegularWidth: Bool = false,
+        destination: SessionNavigationDestination? = nil
+    ) -> ActiveSessionMonitorTaskID {
+        ActiveSessionMonitorTaskID(
+            streamIDs: ["stream-1"],
+            hasActiveRows: hasActiveRows,
+            isViewingCachedData: isViewingCachedData,
+            isRegularWidth: isRegularWidth,
+            destination: destination
+        )
+    }
+
     func testRemovingSelectedSessionClearsDestinationAndRestorationID() {
         let session = SessionSummary(sessionId: "session-1")
         var state = SessionNavigationState()
