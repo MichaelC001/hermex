@@ -215,6 +215,74 @@ final class KanbanFeatureStateTests: XCTestCase {
         XCTAssertFalse(state.isLoading)
     }
 
+    // MARK: - Returning to a loaded Board (#672)
+
+    func testReappearingWithALoadedBoardKeepsItWithoutRequests() async {
+        let client = KanbanClientStub()
+        let state = KanbanFeatureState(server: URL(string: "https://example.test")!, client: client)
+        await state.loadIfNeeded()
+        let loadedCards = state.allCards
+
+        await state.loadIfNeeded()
+
+        XCTAssertEqual(state.state, .compatible)
+        XCTAssertEqual(state.allCards, loadedCards)
+        let calls = await client.calls()
+        XCTAssertEqual(calls, [
+            .configuration,
+            .boards,
+            .board(KanbanBoardRequest(board: "main")),
+            .stats("main"),
+            .assignees("main")
+        ], "Returning to a loaded Board must not repeat the handshake.")
+    }
+
+    func testReappearingWithoutALoadedBoardColdLoadsAgain() async {
+        let client = KanbanClientStub(configurationResult: .failure(CancellationError()))
+        let state = KanbanFeatureState(server: URL(string: "https://example.test")!, client: client)
+        await state.loadIfNeeded()
+        XCTAssertEqual(state.state, .idle)
+
+        await state.loadIfNeeded()
+
+        let calls = await client.calls()
+        XCTAssertEqual(calls, [.configuration, .configuration])
+    }
+
+    func testReappearingAfterACancelledSupplementaryReadFinishesItWithoutColdLoad() async {
+        let client = KanbanClientStub(cancelsFirstStatsRead: true)
+        let state = KanbanFeatureState(server: URL(string: "https://example.test")!, client: client)
+        await Task { await state.loadIfNeeded() }.value
+        XCTAssertNotNil(state.snapshot)
+        XCTAssertNil(state.assigneeHistory)
+
+        await state.loadIfNeeded()
+
+        XCTAssertNotNil(state.stats)
+        XCTAssertNotNil(state.assigneeHistory)
+        let calls = await client.calls()
+        XCTAssertEqual(calls, [
+            .configuration, .boards, .board(KanbanBoardRequest(board: "main")), .stats("main"),
+            .board(KanbanBoardRequest(board: "main")), .stats("main"), .assignees("main")
+        ], "Finishing the reads must keep the loaded Board instead of repeating the handshake.")
+    }
+
+    func testReappearingWithALoadedBoardKeepsArchiveUndo() async throws {
+        let client = ImmediateMutationClient(statusResults: [
+            .success(mutationDecode(#"{"task":{"id":"CARD-1","status":"archived"}}"#))
+        ])
+        let state = KanbanFeatureState(server: URL(string: "https://example.test")!, client: client)
+        await state.loadIfNeeded()
+        let card = try XCTUnwrap(state.allCards.first { $0.cardID == "CARD-1" })
+        await state.archiveCard(card)
+        XCTAssertTrue(state.hasAvailableArchiveUndo)
+
+        await state.loadIfNeeded()
+
+        XCTAssertTrue(state.hasAvailableArchiveUndo)
+        XCTAssertFalse(state.allCards.contains { $0.cardID == card.cardID })
+    }
+
     func testStatusSearchUnknownStatusAndClearFiltersUseLoadedBoardData() async {
         let state = KanbanFeatureState(
             server: URL(string: "https://example.test")!,
@@ -2125,16 +2193,19 @@ private actor KanbanClientStub: KanbanDataClient {
     private let configurationResult: Result<KanbanConfiguration, Error>
     private let boardsResult: Result<KanbanBoardsResponse, Error>
     private let boardResult: Result<KanbanBoardSnapshot, Error>
+    private var cancelsNextStatsRead: Bool
     private var recordedCalls: [Call] = []
 
     init(
         configurationResult: Result<KanbanConfiguration, Error> = .success(KanbanFixtures.configuration),
         boardsResult: Result<KanbanBoardsResponse, Error> = .success(KanbanFixtures.boards),
-        boardResult: Result<KanbanBoardSnapshot, Error> = .success(KanbanFixtures.snapshot)
+        boardResult: Result<KanbanBoardSnapshot, Error> = .success(KanbanFixtures.snapshot),
+        cancelsFirstStatsRead: Bool = false
     ) {
         self.configurationResult = configurationResult
         self.boardsResult = boardsResult
         self.boardResult = boardResult
+        self.cancelsNextStatsRead = cancelsFirstStatsRead
     }
 
     func kanbanConfiguration() throws -> KanbanConfiguration {
@@ -2152,8 +2223,14 @@ private actor KanbanClientStub: KanbanDataClient {
         return try boardResult.get()
     }
 
-    func kanbanStats(board: String) -> KanbanStats {
+    func kanbanStats(board: String) throws -> KanbanStats {
         recordedCalls.append(.stats(board))
+        if cancelsNextStatsRead {
+            cancelsNextStatsRead = false
+            // Models a pop that cancels the Board's `.task` after the snapshot arrived.
+            withUnsafeCurrentTask { $0?.cancel() }
+            throw CancellationError()
+        }
         return KanbanFixtures.stats
     }
 
