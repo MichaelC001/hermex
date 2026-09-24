@@ -78,9 +78,12 @@ actor BotHistoryCache {
     static let maximumBytes = 8 * 1024 * 1024
     static let maximumHits = 100
     static let lifetime: TimeInterval = 30 * 24 * 60 * 60
+    /// Longest a cursor-only room change stays unsaved while other writes are absent.
+    static let cursorOnlySaveInterval: TimeInterval = 10 * 60
     private let directory: URL?
     private var loaded = false
     private var needsPrunePersistence = false
+    private var lastRoomWriteAt = Date.distantPast
     private var snapshots: [Snapshot] = []
     private struct RoomIdentity: Hashable {
         let scope: Scope
@@ -117,8 +120,7 @@ actor BotHistoryCache {
             snapshots.append(Snapshot(id: UUID(), scope: scope, profileID: profileID, profileName: profileName, root: root,
                                       tip: tip, savedAt: receivedAt, messages: rows))
         }
-        prune(now: receivedAt)
-        try persist()
+        try persist(prune(now: receivedAt))
     }
 
     func search(_ query: String, scope: Scope, profileIDs: Set<String>?, roomIDs: Set<String>? = [], now: Date = Date()) throws -> [Hit] {
@@ -183,12 +185,18 @@ actor BotHistoryCache {
             root: "", tip: "", savedAt: max(previous?.savedAt ?? receivedAt, receivedAt), messages: rows,
             roomID: key.roomID, cursor: overlaps ? max(previous?.cursor ?? 0, cursor) : cursor,
             earlierBoundary: boundary)
-        if let previous, previous.messages == next.messages, previous.cursor == next.cursor,
-           previous.earlierBoundary == next.earlierBoundary, previous.profileName == next.profileName { return }
+        let cursorOnly = previous.map { $0.messages == next.messages && $0.earlierBoundary == next.earlierBoundary
+            && $0.profileName == next.profileName } ?? false
+        if cursorOnly, previous?.cursor == next.cursor { return }
         snapshots.removeAll { $0.scope == scope && $0.roomID == key.roomID }
         snapshots.append(next)
-        prune(now: receivedAt)
-        try persist()
+        // Invisible events move only the cursor: keep it in memory and let the next real
+        // write persist it. After a kill, reopening re-reads from the older saved cursor
+        // and the overlap merge above absorbs the repeated pages. A periodic save keeps a
+        // long-running room's saved `savedAt` fresh so it cannot expire on relaunch.
+        guard !cursorOnly || receivedAt.timeIntervalSince(lastRoomWriteAt) >= Self.cursorOnlySaveInterval else { return }
+        try persist(prune(now: receivedAt))
+        lastRoomWriteAt = receivedAt
     }
 
     func roomHistory(_ key: BotRoomKey, now: Date = Date()) throws -> Snapshot? {
@@ -267,17 +275,26 @@ actor BotHistoryCache {
         let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         guard size <= Self.maximumBytes * 2 else { return }
         snapshots = try JSONDecoder().decode([Snapshot].self, from: Data(contentsOf: file))
+        // The newest saved timestamp dates the last write, so a relaunch does not rewrite on its first cursor-only poll.
+        lastRoomWriteAt = snapshots.map(\.savedAt).max() ?? .distantPast
         let previousCount = snapshots.count
         prune(now: Date())
         persistPruning(previousCount: previousCount)
     }
 
-    private func prune(now: Date) {
+    /// Drops expired snapshots, then the oldest ones until the index fits the count and
+    /// byte budget. Returns the encoded index so `persist` does not encode it again.
+    @discardableResult
+    private func prune(now: Date) -> Data? {
         snapshots.removeAll { now.timeIntervalSince($0.savedAt) >= Self.lifetime }
+        if snapshots.count > 100 { snapshots.removeFirst(snapshots.count - 100) }
         // Use encoded bytes for the actual disk budget, including JSON escaping.
-        while !snapshots.isEmpty && (snapshots.count > 100 || ((try? JSONEncoder().encode(snapshots).count) ?? Int.max) > Self.maximumBytes) {
+        // Under budget this is the only encode; each eviction re-encodes once.
+        while !snapshots.isEmpty {
+            if let data = try? JSONEncoder().encode(snapshots), data.count <= Self.maximumBytes { return data }
             snapshots.removeFirst()
         }
+        return nil
     }
 
     /// Expiry cleanup must not prevent reading fresh messages when storage is
@@ -293,11 +310,13 @@ actor BotHistoryCache {
         }
     }
 
-    private func persist() throws {
+    /// Writes the index atomically. Pass `encoded` only when it is `prune`'s
+    /// result for the current `snapshots`.
+    private func persist(_ encoded: Data? = nil) throws {
         guard let directory else { return }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try JSONEncoder().encode(snapshots).write(to: directory.appendingPathComponent("history.json"),
-                                                 options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        try (encoded ?? JSONEncoder().encode(snapshots)).write(to: directory.appendingPathComponent("history.json"),
+            options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
     }
 }
 
