@@ -68,6 +68,11 @@ import Observation
     @ObservationIgnored private var recentRoot: String?
     @ObservationIgnored private var recentOwner: UUID?
     private(set) var liveMessages: [ChatMessage] = []
+    /// The settled row that opened the running turn (its prompt or delegation
+    /// delivery), once the host has persisted it into `messages`; nil while the
+    /// prompt is only live or none is in flight. The live prompt row draws
+    /// only when this is nil.
+    private(set) var activePromptMessageID: String?
     private(set) var errorMessage: String?
     let chatControls = BotChatControls()
     let attachments: BotAttachmentDraft
@@ -101,7 +106,13 @@ import Observation
     private(set) var sequence = 0
     private(set) var epoch: String?
     private(set) var replayWasReset = false
-    private(set) var settledActivity: [BotSettledActivity] = []
+    private(set) var settledActivity: [BotSettledActivity] = [] {
+        didSet { settledActivityByAnchor = Dictionary(grouping: settledActivity, by: \.anchorMessageID) }
+    }
+    /// `settledActivity` grouped by the message each block precedes (nil: after
+    /// the last), rebuilt on every assignment so the transcript body looks a
+    /// row's activity up instead of scanning the whole history per message.
+    private(set) var settledActivityByAnchor: [String?: [BotSettledActivity]] = [:]
     private(set) var liveActivity = BotTurnActivity()
     private(set) var plan: BotPlan?
     /// The transient status line while the bot works: `status.update` text
@@ -201,7 +212,7 @@ import Observation
     private func discardRecentTranscript(keepingVisibleHistory: Bool = false) {
         historyCache?.recent.remove { $0 == recentKey }
         recentOwner = nil; recentRoot = nil; hasRecentTranscript = false
-        if !keepingVisibleHistory { messages = []; settledActivity = []; liveMessages = [] }
+        if !keepingVisibleHistory { messages = []; settledActivity = []; liveMessages = []; activePromptMessageID = nil }
     }
 
     /// Only a current server snapshot can start the transcript clock. Live Activity's
@@ -664,20 +675,30 @@ import Observation
         } else { confirmedWorkingStart = nil }
         if startedAt != turnStartedAt { turnRevision += 1; turnStartedAt = startedAt; turnObservedAt = Date() }
         liveMessages = []
-        // The host can list the prompt in `messages` while it is still the
-        // in-flight `user`, so the same bubble would draw twice until the turn
-        // settles. The settled row wins when it is this turn's prompt; a same-text
-        // prompt from an earlier turn (dated before this turn began) does not
-        // count, so a repeated message still shows while history lags.
+        var activePrompt: String?
+        // The host saves the running turn's opening row (a prompt, or a
+        // delegation delivery) and each step after it mid-turn, so `messages`
+        // can list it while it is still the in-flight `user`. The settled row
+        // wins when the last turn boundary (steers ride inside a turn) is dated
+        // at or after this turn began: the host stamps it after starting the
+        // turn. Text can't decide: a slash skill's row shows its invocation,
+        // not the expanded prompt in flight. Only an undated row falls back to
+        // the text, so a repeated message from an earlier turn still shows
+        // while history lags.
         if let text = inflight["user"].text, !text.isEmpty {
             let display = BotMentions.displayText(text)
-            let settled = messages.last
-            let sameText = settled?.role == "user" && settled?.content == display
-            let fromEarlierTurn = startedAt.map { start in (settled?.timestamp ?? start) < start } ?? false
-            if !(sameText && !fromEarlierTurn) {
+            let settled = messages.last(where: BotTranscriptProjection.isTurnBoundary)
+            let isThisTurn = settled.map { row in
+                guard let start = startedAt, let stamp = row.timestamp else { return row.content == display }
+                return stamp >= start
+            } ?? false
+            if let settled, isThisTurn {
+                activePrompt = settled.id
+            } else {
                 liveMessages.append(ChatMessage(role: "user", content: display, timestamp: nil, messageId: "live-user"))
             }
         }
+        activePromptMessageID = activePrompt
         if let text = inflight["assistant"].text, !text.isEmpty {
             liveMessages.append(ChatMessage(role: "assistant", content: text, timestamp: nil, messageId: "live-assistant"))
         }

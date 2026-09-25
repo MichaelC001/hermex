@@ -77,6 +77,9 @@ import Vision
         let next = BotConversation(server: server, connection: identity, profile: profile, historyCache: cache, wire: wire)
         XCTAssertEqual(next.messages, messages, "Warm entry keeps long text, metadata and delegation cards")
         XCTAssertEqual(next.settledActivity, activity)
+        XCTAssertFalse(activity.isEmpty)
+        XCTAssertEqual(next.settledActivityByAnchor, Dictionary(grouping: activity, by: \.anchorMessageID),
+                       "the restored activity is grouped by the row it precedes")
         XCTAssertTrue(next.hasRecentTranscript)
         XCTAssertNil(next.runtime)
         XCTAssertNil(next.root, "A display snapshot must not dictate the canonical root")
@@ -90,6 +93,7 @@ import Vision
         XCTAssertEqual(next.messages, messages)
         wire.beforeResume = nil; release?.resume(); await refresh.value
         XCTAssertEqual(next.messages.map(\.content), ["saved"], "Fresh history replaces the cached projection, without duplicates")
+        XCTAssertTrue(next.settledActivityByAnchor.isEmpty, "the grouping follows the fresh snapshot")
         XCTAssertFalse(next.hasRecentTranscript)
         next.suspend()
     }
@@ -841,6 +845,65 @@ import Vision
         wire.history = [.object(["role": .string("user"), "text": .string("Tell me story"), "timestamp": .number(250)])]
         await model.recover()
         XCTAssertEqual(model.liveMessages.map(\.content), ["Once"], "dated inside this turn, it is this prompt")
+        model.suspend()
+    }
+
+    /// The host persists each step mid-turn, so a snapshot can list the prompt
+    /// followed by reasoning or an interim reply. The prompt is still this
+    /// turn's, draws once, and names the running turn for folding.
+    func testMidTurnPersistedPromptNamesTheRunningTurnAndDrawsOnce() async {
+        let wire = BotFixtureWire(); wire.running = true; wire.turnStartedAt = 200
+        wire.history = [.object(["role": .string("user"), "text": .string("Tell me story"), "timestamp": .number(210)]),
+                        .object(["role": .string("assistant"), "text": .string(""), "reasoning": .string("Pick a hero"),
+                                 "timestamp": .number(215)]),
+                        .object(["role": .string("assistant"), "text": .string("Drafting"), "timestamp": .number(220)])]
+        wire.inflight = .object(["user": .string("Tell me story"), "assistant": .string("Once")])
+        let model = make(wire); await model.recover()
+        XCTAssertEqual(model.activePromptMessageID, model.messages.first?.id)
+        XCTAssertNotNil(model.activePromptMessageID)
+        XCTAssertFalse(model.liveMessages.contains { $0.role == "user" }, "the settled row already shows the prompt")
+        XCTAssertEqual((model.messages + model.liveMessages).filter { $0.content == "Tell me story" }.count, 1)
+
+        // Last turn's same-text prompt, dated before this turn began, is not this one.
+        wire.history = [.object(["role": .string("user"), "text": .string("Tell me story"), "timestamp": .number(100)]),
+                        .object(["role": .string("assistant"), "text": .string("The end"), "timestamp": .number(150)])]
+        await model.recover()
+        XCTAssertNil(model.activePromptMessageID)
+        XCTAssertEqual(model.liveMessages.map(\.content), ["Tell me story", "Once"])
+
+        wire.running = false; wire.inflight = .null
+        await model.recover()
+        XCTAssertNil(model.activePromptMessageID, "no prompt in flight")
+        model.suspend()
+    }
+
+    /// A slash skill's saved row shows its invocation while the in-flight `user`
+    /// is the expanded body, and a delegation delivery saves as a card: text
+    /// can't match either, so the turn clock names the running turn's row.
+    func testRunningSkillOrDelegationTurnNamesItsSavedRowByTheTurnClock() async {
+        let wire = BotFixtureWire(); wire.running = true; wire.turnStartedAt = 200
+        let reply: BotJSON = .object(["role": .string("assistant"), "text": .string("Looking"), "timestamp": .number(215)])
+        let rows: [BotJSON] = [
+            .object(["role": .string("user"), "text": .string("/work fix the leak"),
+                     "display_kind": .string("skill_invocation"), "timestamp": .number(210)]),
+            .object(["role": .string("user"), "text": .string("[ASYNC DELEGATION BATCH COMPLETE — d1]\nReport"),
+                     "display_kind": .string(BotDelegationCompletion.displayKind), "timestamp": .number(210)])
+        ]
+        wire.inflight = .object(["user": .string("Expanded skill body"), "assistant": .string("Once")])
+        let model = make(wire)
+        for row in rows {
+            wire.history = [row, reply]
+            await model.recover()
+            XCTAssertEqual(model.activePromptMessageID, model.messages.first?.id)
+            XCTAssertFalse(model.liveMessages.contains { $0.role == "user" }, "the saved row already opens this turn")
+        }
+
+        // Dated before this turn began, it is last turn's row: the prompt shows live.
+        wire.history = [.object(["role": .string("user"), "text": .string("/work fix the leak"),
+                                 "display_kind": .string("skill_invocation"), "timestamp": .number(150)]), reply]
+        await model.recover()
+        XCTAssertNil(model.activePromptMessageID)
+        XCTAssertEqual(model.liveMessages.map(\.content), ["Expanded skill body", "Once"])
         model.suspend()
     }
 

@@ -574,8 +574,66 @@ import XCTest
         ChatMessage(role: "user", content: "Again", timestamp: nil, messageId: "live-user")
     }
 
+    /// Sets a standard default for one test; call the result to put it back.
+    private func overrideDefault(_ key: String, _ value: Bool) -> () -> Void {
+        let defaults = UserDefaults.standard
+        let previous = defaults.object(forKey: key)
+        defaults.set(value, forKey: key)
+        return { if let previous { defaults.set(previous, forKey: key) } else { defaults.removeObject(forKey: key) } }
+    }
+
     private func botRow(_ id: String, _ role: String, at timestamp: Double?, displayKind: String? = nil) -> ChatMessage {
         ChatMessage(role: role, content: "Text \(id)", timestamp: timestamp, messageId: id, displayKind: displayKind)
+    }
+
+    /// A settled turn folds its interim reply and work behind the Sessions row;
+    /// the first and last replies stay. Tapping the row is a manual check: the
+    /// hosted window exposes no accessibility tree to activate it through.
+    func testSettledTurnHidesItsInterimReplyBehindTheWorkedForRow() async throws {
+        let restoreFolds = overrideDefault(ChatTranscriptDisplaySettings.foldsSettledTurnsKey, true)
+        let restoreCards = overrideDefault(ChatTranscriptDisplaySettings.showsThinkingAndToolCardsKey, true)
+        defer { restoreFolds(); restoreCards() }
+        let wire = BotFixtureWire()
+        wire.history = [
+            .object(["role": .string("user"), "text": .string("Clean the inbox"), "timestamp": .number(1_000)]),
+            .object(["role": .string("assistant"), "text": .string("Looking now"), "reasoning": .string("Plan the sweep"),
+                     "timestamp": .number(1_010)]),
+            .object(["role": .string("tool"), "name": .string("terminal"), "context": .string("himalaya list")]),
+            .object(["role": .string("assistant"), "text": .string("Halfway there"), "timestamp": .number(1_020)]),
+            .object(["role": .string("assistant"), "text": .string("Archived fourteen"), "timestamp": .number(1_042)])
+        ]
+        let model = make(wire)
+        let window = try show(NavigationStack { BotChatView(model: model) }.environment(\.scenePhase, .active))
+        defer { model.suspend(); close(window) }
+        await model.recover()
+        let folded = try await screenshot(window, name: "747-bot-turn-folded", awaiting: ["Archived fourteen"])
+        XCTAssertTrue(folded.contains("Looking now"), folded)
+        XCTAssertFalse(folded.contains("Halfway there"), folded)
+        XCTAssertTrue(folded.contains("Worked for 42s"), folded)
+        XCTAssertFalse(folded.contains("Thinking"), "the reasoning row folds too: \(folded)")
+    }
+
+    /// A long pause before an interim reply keeps its time separator when the
+    /// reply folds away, so the reader still sees where the turn stalled.
+    func testFoldedInterimReplyKeepsItsGapSeparator() async throws {
+        let restoreFolds = overrideDefault(ChatTranscriptDisplaySettings.foldsSettledTurnsKey, true)
+        defer { restoreFolds() }
+        let start: Double = 1_700_000_000 // 2023: separators name the year.
+        let wire = BotFixtureWire()
+        wire.history = [
+            .object(["role": .string("user"), "text": .string("Clean the inbox"), "timestamp": .number(start)]),
+            .object(["role": .string("assistant"), "text": .string("Looking now"), "timestamp": .number(start + 10)]),
+            .object(["role": .string("assistant"), "text": .string("Halfway there"), "timestamp": .number(start + 7_200)]),
+            .object(["role": .string("assistant"), "text": .string("Archived fourteen"), "timestamp": .number(start + 7_210)])
+        ]
+        let model = make(wire)
+        let window = try show(NavigationStack { BotChatView(model: model) }.environment(\.scenePhase, .active))
+        defer { model.suspend(); close(window) }
+        await model.recover()
+        let folded = try await screenshot(window, name: "747-bot-fold-gap", awaiting: ["Archived fourteen"])
+        XCTAssertFalse(folded.contains("Halfway there"), folded)
+        XCTAssertEqual(folded.components(separatedBy: "2023").count - 1, 2,
+                       "the prompt's separator and the folded reply's gap separator: \(folded)")
     }
 
     func testTransientDisconnectRemainsQuietAboveComposer() async throws {
@@ -1028,6 +1086,9 @@ import XCTest
         let previous = defaults.object(forKey: key)
         defer { if let previous { defaults.set(previous, forKey: key) } else { defaults.removeObject(forKey: key) } }
         defaults.set(true, forKey: key)
+        // The settled turn would fold its cards away; this test is about the cards.
+        let restoreFolds = overrideDefault(ChatTranscriptDisplaySettings.foldsSettledTurnsKey, false)
+        defer { restoreFolds() }
         let wire = BotFixtureWire(); wire.running = true
         wire.history = [
             .object(["role": .string("user"), "text": .string("Summarize yesterday's inbox.")]),
