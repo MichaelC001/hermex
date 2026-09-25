@@ -755,6 +755,32 @@ import XCTest
         XCTAssertTrue(fields.allSatisfy(\.isSecureTextEntry), "A credential field is never in the clear")
     }
 
+    /// The secret field offers Password AutoFill, and a half-typed value never
+    /// outlives its request: a sudo prompt that times out mid-typing must not
+    /// leave the Mac password in the field of the secret that replaces it.
+    func testCredentialFieldOffersAutoFillAndResetsForTheNextRequest() async throws {
+        let harness = CredentialCardHarnessModel(request: .credential(BotCredentialRequest(
+            kind: .sudo, requestID: "sudo-1", envVar: nil, prompt: nil
+        )))
+        let window = try show(CredentialCardHarnessView(model: harness))
+        defer { close(window) }
+        await renderFrames()
+
+        let sudoField = try XCTUnwrap(descendants(window).compactMap { $0 as? UITextField }.first)
+        XCTAssertTrue(sudoField.becomeFirstResponder())
+        sudoField.insertText("hunter2")
+        await renderFrames()
+        XCTAssertEqual(sudoField.text, "hunter2")
+
+        harness.request = .credential(BotCredentialRequest(
+            kind: .secret, requestID: "secret-2", envVar: "OPENAI_API_KEY", prompt: nil
+        ))
+        await renderFrames()
+        let secretField = try XCTUnwrap(descendants(window).compactMap { $0 as? UITextField }.first)
+        XCTAssertEqual(secretField.text ?? "", "", "The Mac password never rides into the secret that replaces it")
+        XCTAssertEqual(secretField.textContentType, .password, "The Passwords key needs a password content type")
+    }
+
     func testTextOnlyEditorRejectsAttachmentProviders() {
         let editor = ComposerChipTextView()
         let image = NSItemProvider(item: NSData(), typeIdentifier: UTType.png.identifier)
@@ -1122,6 +1148,24 @@ import XCTest
         attachment.lifetime = .deleteOnSuccess
         add(attachment)
         return image
+    }
+}
+
+/// Swaps the request under one mounted card, the way `BotChatView` does under
+/// its constant request anchor.
+@MainActor @Observable private final class CredentialCardHarnessModel {
+    var request: BotPendingRequest
+    init(request: BotPendingRequest) { self.request = request }
+}
+
+private struct CredentialCardHarnessView: View {
+    let model: CredentialCardHarnessModel
+    var body: some View {
+        BotPendingRequestCard(
+            request: model.request, identity: "Fixture Mac", isEnabled: true, canStop: true,
+            isAnswering: false, resolution: nil, onApprove: { _ in }, onAnswer: { _ in }, onSkip: {},
+            onCredential: { _ in }, canDecline: false, onDecline: {}, onStop: {}
+        )
     }
 }
 
