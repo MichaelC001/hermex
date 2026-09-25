@@ -508,6 +508,75 @@ import XCTest
         XCTAssertEqual(BotPromptMode.busyChoices(hasAttachments: true), [.queue, .redirect])
     }
 
+    func testOnlyUserMessagesAndTurnEndingRepliesCarryAFooterTime() {
+        let messages = [
+            botRow("u1", "user", at: 1_000),
+            botRow("a1", "assistant", at: 1_010),
+            botRow("s1", "user", at: 1_020, displayKind: ChatMessage.steerDisplayKind),
+            botRow("a2", "assistant", at: 1_030),
+            botRow("d1", "delegation_completion", at: 1_040),
+            botRow("a3", "assistant", at: 1_050),
+            botRow("u2", "user", at: 1_060),
+            botRow("a4", "assistant", at: nil),
+            botRow("u3", "user", at: 1_080),
+            botRow("a5", "assistant", at: 1_090)
+        ]
+        let idle = BotTranscriptTimes(messages: messages, start: 0, livePrompt: nil, turnStartedAt: nil, isMidTurn: false)
+        XCTAssertEqual(idle.footerTimes, ["u1": 1_000, "a2": 1_030, "a3": 1_050, "u2": 1_060, "u3": 1_080, "a5": 1_090],
+                       "interim replies, steers, delegation cards and unstamped rows get no time; a delivery ends the turn before it")
+
+        let interrupted = [
+            botRow("u1", "user", at: 1_000),
+            botRow("a1", "assistant", at: 1_010),
+            ChatMessage(role: "assistant", content: "", timestamp: 1_020, messageId: "a2"),
+            botRow("u2", "user", at: 1_030)
+        ]
+        let stopped = BotTranscriptTimes(messages: interrupted, start: 0, livePrompt: nil, turnStartedAt: nil, isMidTurn: false)
+        XCTAssertEqual(stopped.footerTimes, ["u1": 1_000, "a1": 1_010, "u2": 1_030],
+                       "a text-less reasoning row gets no time and the visible reply before it ends the turn")
+
+        let lateSteer = [
+            botRow("u1", "user", at: 1_000),
+            botRow("a1", "assistant", at: 1_010),
+            botRow("s1", "user", at: 1_020, displayKind: ChatMessage.steerDisplayKind),
+            botRow("u2", "user", at: 1_030)
+        ]
+        let steered = BotTranscriptTimes(messages: lateSteer, start: 0, livePrompt: nil, turnStartedAt: nil, isMidTurn: false)
+        XCTAssertEqual(steered.footerTimes["a1"], 1_010, "a steer the turn never answered doesn't make its last reply interim")
+
+        let running = BotTranscriptTimes(messages: messages, start: 0, livePrompt: nil, turnStartedAt: 1_085, isMidTurn: true)
+        XCTAssertNil(running.footerTimes["a5"], "the last reply of a turn still running is interim")
+        let answeringNext = BotTranscriptTimes(messages: messages, start: 0, livePrompt: livePrompt,
+                                               turnStartedAt: 1_100, isMidTurn: true)
+        XCTAssertEqual(answeringNext.footerTimes["a5"], 1_090, "a live prompt means the settled turn ended")
+
+        let windowed = BotTranscriptTimes(messages: messages, start: 8, livePrompt: nil, turnStartedAt: nil, isMidTurn: false)
+        XCTAssertEqual(windowed.footerTimes, ["u3": 1_080, "a5": 1_090], "only the window's rows are worked out")
+        XCTAssertEqual(windowed.gapStarts, ["u3"], "the window's first stamped row is dated")
+    }
+
+    func testLivePromptIsDatedByTheHostTurnStartAfterAThirtyMinuteGap() {
+        let messages = [botRow("u1", "user", at: 1_000), botRow("a1", "assistant", at: 1_010)]
+        let soon = BotTranscriptTimes(messages: messages, start: 0, livePrompt: livePrompt,
+                                      turnStartedAt: 1_010 + 1_799, isMidTurn: true)
+        XCTAssertNil(soon.livePromptSeparator)
+        let later = BotTranscriptTimes(messages: messages, start: 0, livePrompt: livePrompt,
+                                       turnStartedAt: 1_010 + 1_800, isMidTurn: true)
+        XCTAssertEqual(later.livePromptSeparator, 1_010 + 1_800)
+        XCTAssertEqual(later.gapStarts, ["u1", "live-user"])
+        let undated = BotTranscriptTimes(messages: messages, start: 0, livePrompt: livePrompt,
+                                         turnStartedAt: nil, isMidTurn: true)
+        XCTAssertNil(undated.livePromptSeparator, "no host start time means no separator, never the phone clock")
+    }
+
+    private var livePrompt: ChatMessage {
+        ChatMessage(role: "user", content: "Again", timestamp: nil, messageId: "live-user")
+    }
+
+    private func botRow(_ id: String, _ role: String, at timestamp: Double?, displayKind: String? = nil) -> ChatMessage {
+        ChatMessage(role: role, content: "Text \(id)", timestamp: timestamp, messageId: id, displayKind: displayKind)
+    }
+
     func testTransientDisconnectRemainsQuietAboveComposer() async throws {
         let wire = BotFixtureWire()
         let model = make(wire)
