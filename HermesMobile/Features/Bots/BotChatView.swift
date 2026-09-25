@@ -26,6 +26,8 @@ import SwiftUI
     @State private var composerHeight: CGFloat = 52
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var window = BotTranscriptWindow()
+    /// When the title face's current 15 fps beat began; see `titleFaceMotion`.
+    @State private var workingBeat = BotWorkingBeat()
 
     init(server: URL, connection: BotConnection, profile: BotProfile, roster: [BotProfile],
          avatars: [String: UIImage], conversation: String? = nil,
@@ -169,7 +171,7 @@ import SwiftUI
                     HStack(spacing: 8) {
                         BotAvatarView(profile: model.profile,
                                       avatar: BotAvatarStore.shared.images(connectionID: model.connection.id)[model.profile.id],
-                                      size: 30, motion: isStreaming ? .working : .idle)
+                                      size: 30, motion: titleFaceMotion)
                         Text(model.profile.name).font(.headline).foregroundStyle(.primary).lineLimit(1)
                     }
                     .modifier(BotChatTitlePillFallback())
@@ -218,9 +220,10 @@ import SwiftUI
             if scenePhase == .active { await model.recover() }
         }
         .onChange(of: scenePhase) {
-            if scenePhase == .active { recoveryID = UUID() }
+            if scenePhase == .active { recoveryID = UUID(); workingBeat.rearm() }
             else { stopAction = nil; model.suspend() }
         }
+        .onChange(of: model.turn) { workingBeat.observe(model.turn, at: Date()) }
         .onDisappear { stopAction = nil; model.suspend() }
         .pushPresence(model.pushPresence)
         .onChange(of: model.linkedRootIsStale) {
@@ -322,6 +325,13 @@ import SwiftUI
     }
 
     private var isStreaming: Bool { [.running, .needsAttention, .stopping].contains(model.turn) }
+
+    /// The title face sways for one beat after work starts or the app returns mid-turn,
+    /// then holds a still lean; it never moves while the app is inactive.
+    private var titleFaceMotion: BotFaceMotion {
+        guard scenePhase == .active else { return .still }
+        return isStreaming ? .working(since: workingBeat.start) : .idle
+    }
 
     private var showsScrollToBottomButton: Bool {
         ChatScrollPolicy.showsScrollToBottomButton(
