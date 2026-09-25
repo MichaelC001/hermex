@@ -24,6 +24,7 @@ import SwiftUI
     @State private var showingDelegatedWork = false
     /// Measured composer height; sizes the material fade behind it, as the main chat does.
     @State private var composerHeight: CGFloat = 52
+    @State private var composerFocused = false
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var window = BotTranscriptWindow()
     /// When the title face's current 15 fps beat began; see `titleFaceMotion`.
@@ -170,6 +171,12 @@ import SwiftUI
                         }
                     }
                 }
+                // Simultaneous so links, rows, selection and Latest keep their taps.
+                // Below the overlays so Latest and the empty state count; above the
+                // inset so the composer doesn't. Only the composer loses focus: the
+                // request card has fields of its own.
+                .contentShape(Rectangle())
+                .simultaneousGesture(TapGesture().onEnded { if composerFocused { composerFocused = false } })
                 .adaptiveSoftScrollEdges(.top)
                 .safeAreaInset(edge: .bottom, spacing: 0) { composer }
             }
@@ -369,7 +376,7 @@ import SwiftUI
     /// transcripts end identically. The fade reaches 34 pt above the composer.
     private var composer: some View {
         BotChatComposerView(
-            model: model, mentionAvatars: mentionAvatars,
+            model: model, mentionAvatars: mentionAvatars, isFocused: $composerFocused,
             onStop: { stopAction = model.prepareStop() },
             onReconnect: { recoveryID = UUID() },
             onShowRequest: { showRequestID = UUID() }
