@@ -598,6 +598,52 @@ import Vision
         }
     }
 
+    func testTitleFaceWaitsOnRequestsAndIsSadOnlyAfterAHostFailure() async {
+        let wire = BotFixtureWire(); wire.running = true
+        let model = make(wire)
+        await model.recover()
+        XCTAssertEqual(model.titleFace, .working)
+        wire.attention = true
+        await model.recover()
+        XCTAssertEqual(model.titleFace, .waiting)
+        wire.attention = false; wire.running = false; wire.inflight = .object(["error": .string("boom")])
+        await model.recover()
+        XCTAssertEqual(model.titleFace, .failed)
+        model.suspend()
+        XCTAssertEqual(model.titleFace, .resting, "A disconnected chat shows the pinned face")
+        await model.recover()
+        XCTAssertEqual(model.titleFace, .failed, "The host keeps the error until the next turn")
+        wire.running = true; wire.inflight = .null
+        await model.recover()
+        XCTAssertEqual(model.titleFace, .working)
+        wire.running = false
+        wire.transformResume = { snapshot in
+            guard case .object(var fields) = snapshot else { return snapshot }
+            fields["status"] = .string("interrupted")
+            return .object(fields)
+        }
+        await model.recover()
+        XCTAssertEqual(model.turn, .interrupted)
+        XCTAssertEqual(model.titleFace, .resting, "A user Stop keeps the pinned face")
+        model.suspend()
+
+        XCTAssertEqual(BotConversation.TitleFace.waiting.expression, .curious)
+        XCTAssertEqual(BotConversation.TitleFace.failed.expression, .sad)
+        XCTAssertNil(BotConversation.TitleFace.working.expression)
+        XCTAssertNil(BotConversation.TitleFace.resting.expression)
+
+        let beat = Date(timeIntervalSince1970: 1_000)
+        XCTAssertEqual(BotConversation.TitleFace.working.motion(beatStart: beat), .working(since: beat))
+        XCTAssertEqual(BotConversation.TitleFace.waiting.motion(beatStart: beat), .idle, "An approval never sways")
+        XCTAssertEqual(BotConversation.TitleFace.failed.motion(beatStart: beat), .idle)
+        XCTAssertEqual(BotConversation.TitleFace.resting.motion(beatStart: beat), .idle)
+
+        XCTAssertEqual(BotConversation.TitleFace.waiting.accessibilityValue, String(localized: "Needs attention"))
+        XCTAssertEqual(BotConversation.TitleFace.failed.accessibilityValue, String(localized: "Turn failed"))
+        XCTAssertNil(BotConversation.TitleFace.working.accessibilityValue)
+        XCTAssertNil(BotConversation.TitleFace.resting.accessibilityValue)
+    }
+
     func testReplayFaultsReplaceHistoryWithoutAppendingOverlap() async {
         let wire = BotFixtureWire(); let model = make(wire)
         await model.recover()
