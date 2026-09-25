@@ -357,7 +357,8 @@ import XCTest
 
         let calls: [(String, [String: BotJSON])] = [
             ("subagent.list", ["session_id": .string("runtime")]),
-            ("subagent.tail", ["session_id": .string("runtime"), "subagent_id": .string("worker")])
+            ("subagent.tail", ["session_id": .string("runtime"), "subagent_id": .string("worker")]),
+            ("session.active_list", [:])
         ]
         for (method, params) in calls {
             let started = expectation(description: "\(method) dispatched")
@@ -392,7 +393,7 @@ import XCTest
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [BotHTTPFixture.self]
         let socket = BotScriptedSocket()
-        socket.withholdReply = { $0["method"].text == "subagent.list" }
+        socket.withholdReply = { ["subagent.list", "session.active_list"].contains($0["method"].text) }
         let client = BotClient(connection: connection(), configuration: configuration,
                                rpcDeadline: .milliseconds(50)) { _, _ in socket }
         var disconnects = 0
@@ -400,11 +401,15 @@ import XCTest
         try await client.connect()
         defer { client.close() }
 
-        do {
-            _ = try await client.call("subagent.list", ["session_id": .string("runtime")])
-            XCTFail("Timed-out delegated read succeeded")
-        } catch {
-            XCTAssertEqual(error as? BotFailure, .transport)
+        // The inbox's live-status read is optional the same way: a stall fails only it.
+        let reads: [(String, [String: BotJSON])] = [("subagent.list", ["session_id": .string("runtime")]), ("session.active_list", [:])]
+        for (method, params) in reads {
+            do {
+                _ = try await client.call(method, params)
+                XCTFail("Timed-out \(method) succeeded")
+            } catch {
+                XCTAssertEqual(error as? BotFailure, .transport)
+            }
         }
 
         socket.withholdReply = nil
@@ -559,6 +564,45 @@ import XCTest
             }
         }
         XCTAssertEqual(socket.sentTextFrames, 2)
+    }
+
+    /// The inbox's live-status read is `session.active_list` with no parameters,
+    /// exactly as Desktop's background sync sends it; anything else stays local.
+    func testActiveListAllowlistAdmitsOnlyTheEmptyRead() async throws {
+        BotHTTPFixture.handler = { request in
+            switch request.url!.path {
+            case "/api/status": return (200, .object(["auth_required": .bool(true), "auth_providers": .array([.string("basic")])]))
+            case "/auth/password-login": return (200, .object([:]))
+            case "/api/auth/me": return (200, .object(["provider": .string("basic")]))
+            case "/api/auth/ws-ticket": return (200, .object(["ticket": .string("ticket")]))
+            default: return (404, .null)
+            }
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BotHTTPFixture.self]
+        let socket = BotScriptedSocket()
+        let client = BotClient(connection: connection(), configuration: configuration) { _, _ in socket }
+        try await client.connect()
+        defer { client.close() }
+
+        _ = try await client.call("session.active_list", [:])
+        XCTAssertEqual(socket.sentTextFrames, 1)
+        XCTAssertEqual(socket.sentRequests.last?["method"], .string("session.active_list"))
+        XCTAssertEqual(socket.sentRequests.last?["params"], .object([:]))
+
+        let rejected: [[String: BotJSON]] = [
+            ["current_session_id": .string("runtime")],
+            ["profile": .string("default")]
+        ]
+        for params in rejected {
+            do {
+                _ = try await client.call("session.active_list", params)
+                XCTFail("session.active_list dispatched with \(params)")
+            } catch {
+                XCTAssertEqual(error as? BotFailure, .unsupported)
+            }
+        }
+        XCTAssertEqual(socket.sentTextFrames, 1)
     }
 
     func testCompletionAllowlistAdmitsOneWordAndRejectsEverythingElse() async throws {
