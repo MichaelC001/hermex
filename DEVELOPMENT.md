@@ -62,8 +62,8 @@ launchctl kickstart -k gui/$(id -u)/com.hermes.webui
 ## Local XCTest
 
 Use the repository runner for local tests, including when XcodeBuildMCP is
-available. It builds a signed Debug app and runs XCTest once, serially on the
-assigned simulator. Separate worktrees can test concurrently on separate devices.
+available. It builds a signed Debug app once and runs XCTest serially on the
+assigned simulator (once, or up to N times with `--repeat N`). Separate worktrees can test concurrently on separate devices.
 
 Choose the session's simulator once (`hermex-flow` owns its device pool). The
 main checkout normally uses **iPhone 17**. Resolve its UDID with
@@ -74,6 +74,10 @@ creates one, and refuses to boot a fifth simulator.
 ```zsh
 # Focused tests; repeat --only for multiple classes or individual test methods.
 scripts/test-sim <simulator-udid> --only HermesMobileTests/BotLiveActivityTests
+
+# Stress a flaky test: up to 20 iterations in one build and launch, stopping at
+# the first failure. Use this rather than calling the runner in a loop.
+scripts/test-sim <simulator-udid> --only HermesMobileTests/BotLiveActivityTests --repeat 20
 
 # Full suite (also builds): use the same assigned UDID throughout the session.
 scripts/test-sim <simulator-udid>
@@ -110,8 +114,8 @@ It retries in one case only. Xcode sometimes fails with `The test runner hung
 before establishing connection` before any test runs: the app launches, but
 XCTest inside it never hears that the simulator's `testmanagerd` is ready, and
 xcodebuild gives up after 300 seconds. On that failure, and only when no test
-passed, the runner stops the app and reruns once within the same test time
-limit, printing `RETRY:`. The retry
+passed, the runner reboots that simulator (its own UDID only), stops the app,
+and reruns once within the same test time limit, printing `RETRY:`. The retry
 writes `test-retry.log`, `summary-retry.json`, and `Tests-retry.xcresult` next
 to the first attempt's files. Every other failure is reported without a retry.
 
