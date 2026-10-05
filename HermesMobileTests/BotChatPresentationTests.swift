@@ -1125,6 +1125,69 @@ import XCTest
         XCTAssertTrue(shown.contains("Skip all"), shown)
     }
 
+    /// A Hermes session's approval offers only the host's choices: a smart-denied one shows
+    /// Allow once and Deny, and no Allow session or Always allow (#1011).
+    func testHermesApprovalOverlayShowsOnlyTheHostsChoices() async throws {
+        let approval = try XCTUnwrap(BotApprovalRequest(.object([
+            "request_id": .string("q-1"), "command": .string("rm -rf build"), "description": .string("recursive delete"),
+            "choices": .array([.string("once"), .string("deny")])
+        ])))
+        let window = try show(ApprovalRequestOverlay(
+            content: approval.overlayContent(pendingCount: 1),
+            isResponding: false, errorMessage: nil, onChoice: { _ in }, onSkipAll: {}
+        ))
+        defer { close(window) }
+        let shown = try await screenshot(window, name: "hermes-approval-overlay", awaiting: ["Allow once", "Deny", "Skip all"])
+        XCTAssertTrue(["Allow once", "Deny", "Skip all"].allSatisfy(shown.contains), shown)
+        XCTAssertFalse(shown.contains("Allow session"), shown)
+        XCTAssertFalse(shown.contains("Always allow"), shown)
+    }
+
+    /// A Hermes session's sudo prompt shows in the clarification's slot as the Bot credential
+    /// card, measured and then shown whole, with its masked field (#1011).
+    func testHermesSudoPromptShowsTheCredentialCardAboveTheComposer() async throws {
+        let window = try show(VStack {
+            Spacer()
+            HermesRequestInset(
+                request: .credential(BotCredentialRequest(kind: .sudo, requestID: "srq-s1", envVar: nil, prompt: nil)),
+                identity: "default on Mac", maximumExpandedHeight: 600, isEnabled: true, isAnswering: false,
+                isStopping: false, isHapticsEnabled: false, onAnswer: { _ in }, onSkip: {}, onCredential: { _ in },
+                onStop: {}, onDismissKeyboard: {}, onFootprintChange: { _ in }
+            )
+            .padding(.horizontal, 16)
+            .padding(.bottom, 80)
+        })
+        defer { close(window) }
+        let shown = try await screenshot(window, name: "hermes-sudo-inset", awaiting: ["Administrator password needed", "Skip"])
+        XCTAssertTrue(shown.contains("Administrator password needed"), shown)
+        XCTAssertTrue(shown.contains("Skip"), shown)
+        let field = try XCTUnwrap(descendants(window).compactMap { $0 as? UITextField }.first, "Expected the credential field")
+        XCTAssertTrue(field.isSecureTextEntry)
+    }
+
+    /// With no room for a line of the card (a tall composer under the keyboard), a Hermes
+    /// request falls back to its bar, as the webui clarification card does, and the collapse
+    /// puts the keyboard away (#1011). With room it stays open.
+    func testHermesRequestInsetFallsBackToItsBarWhenTheCardCannotFit() async throws {
+        var collapses: [CGFloat: Int] = [:]
+        for height: CGFloat in [40, 600] {
+            let window = try show(VStack {
+                Spacer()
+                HermesRequestInset(
+                    request: .credential(BotCredentialRequest(kind: .sudo, requestID: "srq-s1", envVar: nil, prompt: nil)),
+                    identity: "default on Mac", maximumExpandedHeight: height, isEnabled: true, isAnswering: false,
+                    isStopping: false, isHapticsEnabled: false, onAnswer: { _ in }, onSkip: {}, onCredential: { _ in },
+                    onStop: {}, onDismissKeyboard: { collapses[height, default: 0] += 1 }, onFootprintChange: { _ in }
+                )
+                .padding(.horizontal, 16)
+                .padding(.bottom, 80)
+            })
+            await settle(window) { collapses[height] != nil }
+            close(window)
+        }
+        XCTAssertEqual(collapses, [40: 1], "only the card with no room collapses, once")
+    }
+
     /// A sudo prompt is answered here, not at the Mac: a masked field, a Skip,
     /// and the handling line stated before anything is typed.
     func testSudoCardOffersAMaskedFieldAndSaysWhereTheValueGoes() async throws {
