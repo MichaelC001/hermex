@@ -472,7 +472,8 @@ struct ChatView: View {
                     composerIsFocused = value
                 }
             ),
-            isSending: viewModel.isStartingChat || viewModel.isSendingVoiceNote,
+            // A Hermes prompt whose answer was lost holds Send until the chat reattaches (#508).
+            isSending: viewModel.isStartingChat || viewModel.isSendingVoiceNote || viewModel.isHermesSubmissionUncertain,
             isCompressingSession: viewModel.isCompressingSession,
             isWaitingForStream: viewModel.activeStreamID != nil,
             isCancellingStream: viewModel.isCancellingStream,
@@ -632,7 +633,9 @@ struct ChatView: View {
             onRefreshGitBranches: {
                 Task { await gitAvailabilityViewModel.loadBranches() }
             },
-            showsSessionControls: !isHermesSession
+            showsSessionControls: !isHermesSession,
+            uploadsAttachmentsOnSend: isHermesSession,
+            onCancelAttachmentUpload: viewModel.isSendingAttachments ? { viewModel.cancelAttachmentUpload() } : nil
         )
         // The composer flips wholesale with the transcript under the RTL
         // toggle (#259): input, placeholder, and chrome mirror together.
@@ -1630,7 +1633,7 @@ struct ChatView: View {
             loadAttachmentImage: { path in
                 await viewModel.attachmentImageData(path: path)
             },
-            loadAttachmentData: { path in
+            loadAttachmentData: isHermesSession ? nil : { path in
                 await viewModel.attachmentRawData(path: path)
             },
             loadTranscriptMediaImage: { reference in
@@ -2428,6 +2431,7 @@ struct ChatView: View {
         let quotesBeforeHydration = draftQuotes
         let persistedDraft = await draftStore.draft(for: draftKey)
         viewModel.protectDraftAttachments(for: draftKey, restoring: persistedDraft?.attachments ?? [])
+        viewModel.restoreSubmissionMark(persistedDraft?.botSubmissionUncertain == true)
         guard !Task.isCancelled,
               draftMessage == textBeforeHydration,
               draftQuotes == quotesBeforeHydration
@@ -2465,7 +2469,8 @@ struct ChatView: View {
     }
 
     /// Rebuilds the composer's staged attachments from a persisted draft by
-    /// re-uploading each record's durable local copy against this session. The
+    /// re-uploading each record's durable local copy against this session (a
+    /// Hermes session only stages it again; its send uploads it). The
     /// persisted server path is never trusted: uploads live in a per-session
     /// inbox the server deletes with the session, so only the app-owned copy
     /// is a sound restore source. Records whose copy is missing are dropped
@@ -2773,7 +2778,6 @@ struct ChatView: View {
     }
 
     private func handlePhotoSelection(_ media: [HermexPickedMedia]) async {
-        guard !isHermesSession else { return }
         for item in media {
             guard !Task.isCancelled else { return }
             await viewModel.uploadAttachment(
@@ -2785,7 +2789,6 @@ struct ChatView: View {
     }
 
     private func handleSelectedFileURLs(_ urls: [URL]) async {
-        guard !isHermesSession else { return }
         let fileURLs = urls.filter(\.isFileURL)
 
         guard !fileURLs.isEmpty else {
@@ -2804,7 +2807,6 @@ struct ChatView: View {
     }
 
     private func handlePastedFileProviders(_ providers: [NSItemProvider]) async {
-        guard !isHermesSession else { return }
         let fileProviders = providers.filter {
             $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
         }
@@ -2825,7 +2827,6 @@ struct ChatView: View {
     }
 
     private func handlePastedImageProviders(_ providers: [NSItemProvider]) async {
-        guard !isHermesSession else { return }
         let imageProviders = providers.filter {
             $0.hasItemConformingToTypeIdentifier(UTType.image.identifier)
         }
@@ -2846,7 +2847,6 @@ struct ChatView: View {
     }
 
     private func handlePastedImages(_ images: [UIImage]) async {
-        guard !isHermesSession else { return }
         guard !images.isEmpty else {
             viewModel.setUploadAttachmentError(String(localized: "Paste a copied image to attach it."))
             return
@@ -2888,7 +2888,6 @@ struct ChatView: View {
     }
 
     private func handlePastedFileURLs(_ urls: [URL]) async {
-        guard !isHermesSession else { return }
         let fileURLs = urls.filter(\.isFileURL)
 
         guard !fileURLs.isEmpty else {
@@ -2922,13 +2921,16 @@ struct ChatView: View {
         return PastedFile(data: data, filename: filename)
     }
 
+    /// Refuses a file over the chat's limit before reading it: 20 MB on a webui session,
+    /// Bot Chat's 25 MB on a Hermes session (#1012).
     private func validateAttachmentSize(for url: URL) throws {
         let values = try url.resourceValues(forKeys: [.fileSizeKey])
         guard let size = values.fileSize,
-              size > PendingAttachment.maximumUploadBytes
+              size > (isHermesSession ? BotAttachmentDraft.maximumFileBytes : PendingAttachment.maximumUploadBytes)
         else {
             return
         }
+        if isHermesSession { throw BotAttachmentFailure.limit }
 
         let filename = url.lastPathComponent.isEmpty ? String(localized: "Selected file") : url.lastPathComponent
         throw PastedFileError.fileTooLarge(filename: filename)
