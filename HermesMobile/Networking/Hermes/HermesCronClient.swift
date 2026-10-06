@@ -5,7 +5,8 @@ import Foundation
 /// model and Profile lists over the shared gateway socket. A mutation names the job's own
 /// Profile (`?profile=`), which the host treats as a hint and checks. A refusal the host
 /// explains reads as its `detail` (`accepted`). Every job also carries `hermes_home`, a host
-/// path, which is never decoded.
+/// path, which is never decoded. A run is the session it ran in (#1042), and its output is that
+/// session's final reply: nothing is read from the host's disk.
 @MainActor final class HermesCronClient: CronDataClient {
     nonisolated var cronFeatures: CronFeatures { .hermes }
     private let http: HermesConnection
@@ -112,18 +113,29 @@ import Foundation
         }
     }
 
-    // The screens never ask a Hermes host for these (`cronFeatures`): its recent runs come
-    // with the list, and run history arrives with #1042.
+    // The screens never ask a Hermes host for these (`cronFeatures`): its recent runs come with
+    // the list, and its latest output is the newest finished run's reply (`cronRunDetail`).
 
     func cronRecent() async throws -> CronRecentCompletionsResponse { throw BotFailure.unsupported }
     func cronOutput(jobID _: String, limit _: Int?) async throws -> CronOutputResponse { throw BotFailure.unsupported }
 
-    func cronHistory(jobID _: String, offset _: Int, limit _: Int) async throws -> CronRunHistoryResponse {
-        throw BotFailure.unsupported
+    /// The Task's newest 100 runs, the most the host lists and the one page it has: it takes no
+    /// offset and reports no total, so the screens offer no more (#1042).
+    func cronHistory(jobID: String, profile: String?, offset: Int, limit _: Int) async throws -> CronRunHistoryResponse {
+        guard offset == 0 else { return CronRunHistoryResponse(jobId: jobID, runs: [], total: nil, offset: offset) }
+        let page = try await send(.cronRuns(id: jobID, profile: profile, limit: 100))
+        return CronRunHistoryResponse(jobId: jobID, runs: try Self.decoder.decode(HermesCronRuns.self, from: page).runs,
+                                      total: nil, offset: offset)
     }
 
-    func cronRunDetail(jobID _: String, filename _: String) async throws -> CronRunDetailResponse {
-        throw BotFailure.unsupported
+    /// One run's output: its session's final reply (`HermesREST.sessionMessages`), the last
+    /// assistant message that is not a tool call, as a side session's result is; nil when it gave
+    /// none. A run the host no longer has (404) is `HermesCronRunUnavailable`.
+    func cronRunDetail(jobID: String, profile: String?, filename runID: String) async throws -> CronRunDetailResponse {
+        let answer = try await reply(.sessionMessages(key: runID, profile: profile ?? ""))
+        guard answer.status != 404 else { throw HermesCronRunUnavailable() }
+        let messages = try Self.json(try Self.accepted(answer))["messages"].list ?? []
+        return CronRunDetailResponse(jobId: jobID, filename: runID, content: HermesChatSideTasks.result(messages), snippet: nil)
     }
 
     // MARK: - Wire
@@ -189,6 +201,65 @@ import Foundation
 struct HermesCronRefusal: LocalizedError, Equatable {
     let detail: String
     var errorDescription: String? { String(localized: "The server rejected the request: \(detail)") }
+}
+
+/// A run whose session the host no longer has (#1042).
+struct HermesCronRunUnavailable: LocalizedError, Equatable {
+    var errorDescription: String? { String(localized: "This run is no longer on the server.") }
+}
+
+/// `GET /api/cron/jobs/{id}/runs` as history rows (#1042). Each row is the run's whole session,
+/// `system_prompt` included, of which only the fields a row shows are decoded. A row without
+/// an id can't be opened, so it is left out; a page without its `runs` list is a failed read,
+/// not a Task that never ran.
+private struct HermesCronRuns: Decodable {
+    let runs: [CronRunHistoryItem]
+
+    enum CodingKeys: String, CodingKey { case runs }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        runs = try container.decode([Run].self, forKey: .runs).compactMap(\.item)
+    }
+
+    /// One row. A run lasted from `started_at` to `ended_at`, epoch seconds, and is `is_active`
+    /// until it ends. Its cost is the provider's actual one when known, else the host's estimate;
+    /// its tokens are its input and output.
+    private struct Run: Decodable {
+        let item: CronRunHistoryItem?
+
+        enum CodingKeys: String, CodingKey {
+            case id, startedAt, endedAt, isActive, model, inputTokens, outputTokens, estimatedCostUsd, actualCostUsd
+        }
+
+        init(from decoder: Decoder) throws {
+            guard let row = try? decoder.container(keyedBy: CodingKeys.self),
+                  let id = row.decodeLossyStringIfPresent(forKey: .id), !id.isEmpty else {
+                item = nil
+                return
+            }
+            // `Date(timeIntervalSince1970:)` takes NaN and infinity and traps later, in formatting.
+            let date = { (key: CodingKeys) in
+                row.decodeLossyDoubleIfPresent(forKey: key).flatMap { $0.isFinite ? Date(timeIntervalSince1970: $0) : nil }
+            }
+            let started = date(.startedAt), ended = date(.endedAt)
+            let input = row.decodeLossyIntIfPresent(forKey: .inputTokens)
+            let output = row.decodeLossyIntIfPresent(forKey: .outputTokens)
+            let tokens = (input ?? 0).addingReportingOverflow(output ?? 0)
+            var run = CronRunHistoryItem(filename: id, modified: ended, usage: CronRunUsage(
+                model: row.decodeLossyStringIfPresent(forKey: .model),
+                estimatedCostUsd: row.decodeLossyDoubleIfPresent(forKey: .actualCostUsd)
+                    ?? row.decodeLossyDoubleIfPresent(forKey: .estimatedCostUsd),
+                durationSeconds: started.flatMap { start in ended.map { $0.timeIntervalSince(start) } },
+                inputTokens: input,
+                outputTokens: output,
+                totalTokens: (input == nil && output == nil) || tokens.overflow ? nil : tokens.partialValue
+            ))
+            run.startedAt = started
+            run.isRunning = row.decodeLossyBoolIfPresent(forKey: .isActive) ?? false
+            item = run
+        }
+    }
 }
 
 extension CronJobList {

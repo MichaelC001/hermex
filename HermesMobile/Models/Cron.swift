@@ -288,6 +288,11 @@ struct CronOutputItem: Decodable, Equatable, Identifiable {
         case content
     }
 
+    init(filename: String?, content: String?) {
+        self.filename = filename
+        self.content = content
+    }
+
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         filename = try container.decodeIfPresent(String.self, forKey: .filename)
