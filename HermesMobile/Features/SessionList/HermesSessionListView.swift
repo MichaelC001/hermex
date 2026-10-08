@@ -18,12 +18,22 @@ struct HermesSessionListEntry: Hashable, Identifiable {
 /// and a row opens in the main chat on top of it. Its socket listens while it is on screen, rests
 /// while a chat covers it, and closes when it leaves or the app goes to the background. Rows
 /// rename, pin, archive (with Undo and an Archived screen), delete and export as JSON (#1048).
+/// Its project rows are the host's folder-based project lanes (#1052): a pick filters the list to
+/// one lane, and a row's Move to Project changes the session's working folder.
 struct HermesSessionListView: View {
+    /// The webui list's Projects disclosure, alone.
+    private static let projectRows = SidebarSectionVisibility(
+        bots: false, tasks: false, kanban: false, skills: false, memory: false, insights: false,
+        activeProfile: false, projects: true
+    )
+
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(SessionRowDisplaySettings.showMessageCountKey) private var showsMessageCount = true
     @AppStorage(SessionRowDisplaySettings.showWorkspaceKey) private var showsWorkspace = true
     @AppStorage(AppHaptics.isEnabledKey) private var isHapticsEnabled = true
+    @AppStorage(SessionSidebarDisclosureSettings.projectsAreExpandedKey)
+    private var projectsAreExpanded = SessionSidebarDisclosureSettings.defaultProjectsAreExpanded
     private let entry: HermesSessionListEntry
     @State private var viewModel: SessionListViewModel
     /// The chat a row or New Session opened.
@@ -33,6 +43,15 @@ struct HermesSessionListView: View {
     @State private var exported: SessionExportShareItem?
     @State private var showingArchived = false
     @State private var actionToast = ActionToastState()
+    /// The project lane the list shows; nil shows every session.
+    @State private var selectedProjectID: String?
+    @State private var creatingProject: HermesProjectCreation?
+    @State private var renamingProject: ProjectSummary?
+    @State private var deletingProject: ProjectSummary?
+    @State private var moving: HermesProjectMove?
+    /// The Move to Project a project created from a row's Move menu still needs, asked once the
+    /// sheet is gone.
+    @State private var movingAfterCreation: HermesProjectMove?
 
     init(entry: HermesSessionListEntry) {
         self.entry = entry
@@ -44,10 +63,17 @@ struct HermesSessionListView: View {
 
     var body: some View {
         List {
+            SessionSidebarUtilityRows(
+                viewModel: viewModel, topPadding: 10, automatedVisibility: .showAll, sectionVisibility: Self.projectRows,
+                profilesAreExpanded: .constant(false), projectsAreExpanded: $projectsAreExpanded,
+                selectedProjectID: $selectedProjectID, projectPendingDeletion: $deletingProject,
+                projectPendingRename: $renamingProject, openDestination: { _ in }, switchActiveProfile: { _ in },
+                presentProjectCreation: { creatingProject = HermesProjectCreation(folder: "") }
+            )
             SessionListRowsSection(
                 viewModel: viewModel,
-                sessions: viewModel.visibleSessions(searchText: "", selectedProjectID: nil),
-                emptyTitle: String(localized: "No sessions yet"),
+                sessions: viewModel.visibleSessions(searchText: "", selectedProjectID: selectedProjectID),
+                emptyTitle: selectedProjectID == nil ? String(localized: "No sessions yet") : String(localized: "No sessions in this project"),
                 emptyDescription: nil,
                 isSearchActive: false,
                 showsMessageCount: showsMessageCount,
@@ -55,11 +81,12 @@ struct HermesSessionListView: View {
                 selectedSessionID: nil,
                 actions: actions
             )
-            if viewModel.hasMoreSessions { loadMoreRow }
+            if showsLoadMore { loadMoreRow }
             archivedRow
         }
         .listStyle(.plain)
         .environment(\.defaultMinListRowHeight, 0)
+        .animation(SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion), value: projectsAreExpanded)
         .overlay(alignment: .bottom) {
             ActionToastView(state: actionToast)
                 .frame(maxWidth: 420)
@@ -100,14 +127,58 @@ struct HermesSessionListView: View {
                 // Each export has its own temp directory (`SessionListViewModel.export`).
                 .onDisappear { try? FileManager.default.removeItem(at: item.fileURL.deletingLastPathComponent()) }
         }
+        .sheet(item: $creatingProject, onDismiss: {
+            viewModel.clearProjectSheetError()
+            moving = movingAfterCreation
+            movingAfterCreation = nil
+        }) { creation in
+            ProjectCreationSheet(
+                existingProjectCount: viewModel.projects.count, isSaving: viewModel.isCreatingProject,
+                folder: ProjectFolderField(initialPath: creation.folder) { await viewModel.completeHermesFolder($0) },
+                errorMessage: viewModel.projectSheetErrorMessage
+            ) {
+                creatingProject = nil
+            } onSave: { name, color, folder in
+                Task {
+                    guard let saved = await viewModel.createHermesProject(named: name, color: color, folder: folder ?? "") else { return }
+                    movingAfterCreation = creation.move(intoProjectNamed: name, savedOn: saved, isBusy: creation.session
+                        .map { viewModel.attentionState(for: $0) != nil } ?? false)
+                    creatingProject = nil
+                }
+            }
+            .presentationDetents([.medium, .large])
+        }
+        .sheet(item: $renamingProject, onDismiss: { viewModel.clearProjectSheetError() }) { project in
+            ProjectRenameSheet(project: project, isSaving: viewModel.isRenamingProject,
+                               errorMessage: viewModel.projectSheetErrorMessage) {
+                renamingProject = nil
+            } onSave: { name, color in
+                Task { if await viewModel.rename(project, named: name, color: color) { renamingProject = nil } }
+            }
+            .presentationDetents([.medium])
+        }
+        .alert(Text(verbatim: moving?.title ?? ""), isPresented: Binding(get: { moving != nil }, set: { if !$0 { moving = nil } }),
+               presenting: moving) { move in
+            Button("Cancel", role: .cancel) {}
+            Button("Move") { Task { await self.move(move) } }
+        } message: { move in
+            Text(verbatim: move.message)
+        }
         .modifier(SessionActionConfirmations(
-            viewModel: viewModel, sessionPendingDeletion: $deleting, projectPendingDeletion: .constant(nil),
-            deleteSession: { session in Task { await delete(session) } }, deleteProject: { _ in }
+            viewModel: viewModel, sessionPendingDeletion: $deleting, projectPendingDeletion: $deletingProject,
+            deleteSession: { session in Task { await delete(session) } },
+            deleteProject: { project in Task { _ = await viewModel.delete(project) } }
         ))
         .task { await viewModel.openHermes() }
         .onDisappear {
             actionToast.dismiss()
             if chat == nil { viewModel.closeHermes() } else { viewModel.pauseHermes() }
+        }
+        // A lane the host no longer lists (deleted here or on Desktop, or another Profile's) clears.
+        .onChange(of: viewModel.projects) {
+            if let selectedProjectID, !viewModel.projects.contains(where: { $0.projectId == selectedProjectID }) {
+                self.selectedProjectID = nil
+            }
         }
         .onChange(of: chat) { old, new in
             if case .session(_, let key)? = old?.target, new?.id != old?.id { viewModel.noteHermesReturn(from: key) }
@@ -143,16 +214,36 @@ struct HermesSessionListView: View {
         }
     }
 
-    /// The list's end: the next page loads as it comes into view, and a tap tries again
-    /// after a failed one.
+    /// More pages may hold rows this list shows: any, or the selected lane's that the host
+    /// named and the loaded pages lack.
+    private var showsLoadMore: Bool {
+        guard viewModel.hasMoreSessions else { return false }
+        return selectedProjectID.map(viewModel.hermesLaneIsShort) ?? true
+    }
+
+    /// The list's end: the next page loads as it comes into view, or in a lane every page
+    /// until the lane is whole, and a tap tries again after a failed one. Keyed by the lane,
+    /// so picking another lane loads its pages too. A lane picked while another page was
+    /// loading starts its own once that page's rows are in; a failed page changes no rows, so
+    /// it never retries on its own.
     private var loadMoreRow: some View {
-        Button("Load more") { Task { await viewModel.loadMoreHermesSessions() } }
+        Button("Load more") { Task { await loadMore() } }
             .font(.subheadline)
             .foregroundStyle(.secondary)
             .disabled(viewModel.isLoadingMoreSessions)
             .frame(maxWidth: .infinity, minHeight: 44)
             .sessionsScreenListRow()
-            .onAppear { Task { await viewModel.loadMoreHermesSessions() } }
+            .onAppear { Task { await loadMore() } }
+            .onChange(of: viewModel.sessions.count) {
+                guard let selectedProjectID else { return }
+                Task { await viewModel.fillHermesLane(selectedProjectID) }
+            }
+            .id(selectedProjectID)
+    }
+
+    private func loadMore() async {
+        if let selectedProjectID { await viewModel.fillHermesLane(selectedProjectID) }
+        else { await viewModel.loadMoreHermesSessions() }
     }
 
     /// The Profile's archived sessions, hidden Bot Chats included, where they are restored.
@@ -184,7 +275,9 @@ struct HermesSessionListView: View {
     }
 
     /// Opening a row, Mark as Read or Unread, and the row actions `SessionRowActionPolicy`
-    /// offers a Hermes row; Duplicate and Move wait on later slices of #702.
+    /// offers a Hermes row; Duplicate waits on a later slice of #702. Move to Project asks first,
+    /// and its New Project starts on the session's folder, then asks to move it there if it
+    /// was saved on another.
     private var actions: SessionListRowActions {
         SessionListRowActions(
             retryLoad: { Task { await viewModel.openHermes() } },
@@ -201,7 +294,15 @@ struct HermesSessionListView: View {
                 viewModel.clearRenameError()
                 renaming = session
             },
-            duplicate: { _ in }, move: { _, _ in }, createProject: { _ in }, refreshProjects: {},
+            duplicate: { _ in },
+            move: { session, projectID in
+                guard let project = viewModel.projects.first(where: { $0.projectId == projectID }),
+                      let folder = project.hermes?.folder else { return }
+                moving = HermesProjectMove(session: session, projectName: project.name ?? folder, folder: folder,
+                                           isBusy: viewModel.attentionState(for: session) != nil)
+            },
+            createProject: { session in creatingProject = HermesProjectCreation(folder: session.workspace ?? "", session: session) },
+            refreshProjects: { Task { await viewModel.openHermes() } },
             export: { session, format in
                 Task { if let url = await viewModel.export(session, format: format) { exported = SessionExportShareItem(fileURL: url) } }
             }
@@ -236,6 +337,19 @@ struct HermesSessionListView: View {
         ))
     }
 
+    /// "Moved · Undo" once the host confirms; Undo moves the session back to the folder it left.
+    private func move(_ move: HermesProjectMove) async {
+        guard let previous = await viewModel.moveHermesSession(move.session, toFolder: move.folder) else { return }
+        let message = String(localized: "Moved")
+        actionToast.show(ActionToast(
+            message: message, systemImage: "folder",
+            accessibilityLabel: String.localizedStringWithFormat(String(localized: "%@, %@"),
+                                                                 SessionRowView.displayTitle(for: move.session), message),
+            actionTitle: String(localized: "Undo"),
+            action: { Task { _ = await viewModel.moveHermesSession(move.session, toFolder: previous) } }
+        ))
+    }
+
     private func delete(_ session: SessionSummary) async {
         if await viewModel.delete(session, animation: mutationAnimation) {
             SessionHaptics.sessionDeleted(isEnabled: isHapticsEnabled)
@@ -246,6 +360,43 @@ struct HermesSessionListView: View {
         let renamed = await viewModel.rename(session, to: title)
         if renamed, title != session.title { SessionHaptics.sessionRenamed(isEnabled: isHapticsEnabled) }
         return renamed
+    }
+}
+
+/// A project sheet opened for a new Hermes project (#1052), on `folder` (the session's own when
+/// it came from a row's Move menu).
+struct HermesProjectCreation: Identifiable {
+    let id = UUID()
+    let folder: String
+    /// The session whose Move menu opened the sheet; nil from the list's New Project.
+    var session: SessionSummary?
+
+    /// The Move to Project that puts `session` in the project just saved on `folder`, which asks
+    /// first as any other does. Nil from the list's New Project, or when the session works in
+    /// `folder` itself, which makes it the project's. A session under `folder` is asked too: a
+    /// project on a deeper folder may still claim it.
+    func move(intoProjectNamed name: String, savedOn folder: String, isBusy: Bool) -> HermesProjectMove? {
+        guard let session, session.workspace != folder else { return nil }
+        return HermesProjectMove(session: session, projectName: name.trimmingCharacters(in: .whitespacesAndNewlines),
+                                 folder: folder, isBusy: isBusy)
+    }
+}
+
+/// A Move to Project waiting on its confirmation (#1052), with copy that says what it does: Hermes
+/// works in the project's folder from then on, and no file moves. A busy session moves mid-turn.
+struct HermesProjectMove: Identifiable {
+    let session: SessionSummary
+    let projectName: String
+    let folder: String
+    /// A reply runs, or waits on an answer, in the session.
+    let isBusy: Bool
+
+    var id: String { session.id }
+    var title: String { String(localized: "Move to \(projectName)?") }
+    var message: String {
+        isBusy
+            ? String(localized: "Hermes will work in \(folder) from now on, including the reply that's running now. Files aren't moved.")
+            : String(localized: "Hermes will work in \(folder) from now on. Files aren't moved.")
     }
 }
 
