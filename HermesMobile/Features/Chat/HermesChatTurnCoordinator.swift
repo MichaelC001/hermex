@@ -77,7 +77,8 @@ struct HermesChatTranscript: Equatable {
 /// requests (approvals, questions, sudo and secret prompts) are `requests` (#1011); the goal,
 /// `/btw` and `/background` are `sideTasks` (#1013); its model and Profile chips are
 /// `settings` (#1015); its host's slash commands are `slashCommands` (#1036). Edit,
-/// Regenerate, `/retry` and `/undo` cut the host's history (`rewind`, `undo`; #1049).
+/// Regenerate, `/retry` and `/undo` cut the host's history (`rewind`, `undo`; #1049), and
+/// `/compress` compacts it (`compress`; #1050).
 ///
 /// A turn's identity is the stored key and the host's `turn_started_at`, in place of a
 /// webui stream id. A turn starts at `message.start`, an accepted send or a running
@@ -115,6 +116,15 @@ struct HermesChatTranscript: Equatable {
     @ObservationIgnored private var hostRunning = false
     /// The last title `session.info` reported, so a repeat leaves the header alone.
     @ObservationIgnored private var infoTitle: String?
+    /// The session's working folder, as the latest `session.info` or attach reports it.
+    /// `/clear` starts its new chat there (#1050).
+    @ObservationIgnored private(set) var cwd: String?
+    /// The session's model and provider, as the latest `session.info` or attach reports them:
+    /// `/clear`'s new chat takes it while the model chip has no choice to offer (#1050).
+    @ObservationIgnored private(set) var reportedModel: HermesCall.Model?
+    /// A `/compress` the compute host answered `pending`: its `status.update {kind:
+    /// "compacted"}` re-reads the history, and until then a rebuild starts it again (#1050).
+    @ObservationIgnored private var compactionPending = false
     /// How the running turn ended, from `message.complete`, until `session.info` says idle.
     @ObservationIgnored private var pendingEnding: TranscriptTurnRunOutcome.Ending?
     /// The turn began from a send's reply; its own `message.start` is still to come.
@@ -486,6 +496,102 @@ struct HermesChatTranscript: Equatable {
         delegate?.hermesReplaceTranscript(historyTranscript())
     }
 
+    /// What `/compress` did (#1050).
+    enum Compression: Equatable {
+        /// The host compacted the history, and the newest page replaced the transcript. The
+        /// summary's headline and token line, when the host sent them.
+        case compacted(headline: String?, tokenLine: String?)
+        /// Nothing was removed: the summary would not have shrunk it, it was aborted, another
+        /// compressor holds the session's lock, or the compute host is still at it. The host's
+        /// words, when it sent any.
+        case unchanged(String?)
+    }
+
+    /// `/compress` and `/compact` (#1050): `session.compress` on the runtime, with the Profile
+    /// and any `focus`. Once the host removed rows, the history starts again from the newest
+    /// page, since the compaction archived or re-numbered every row held, and that page
+    /// replaces the transcript, compaction card included; Load earlier reaches the rest. A
+    /// rotated stored key in the reply's `info` is adopted first. Sent once; a busy host
+    /// refuses it (4009). Throws as `rewind` does; after a lost or unreadable answer the next
+    /// attach, now or once the chat is back, reads the history from the newest page and
+    /// rebuilds, since the host may have compacted it.
+    func compress(focus: String?) async throws -> Compression {
+        await activate()
+        guard engine.connectionState == .connected, let runtime = engine.runtime else {
+            throw NotSent(underlying: BotFailure.transport)
+        }
+        let attempt = engine.generation
+        let reply: BotJSON
+        do {
+            reply = try await writeOnce(.sessionCompress(runtime: runtime, focus: focus, profile: engine.target.profile),
+                                        runtime: runtime)
+        } catch {
+            if !(error is NotSent || error is BotSettingFailure) { forgetHistoryUntilRebuild() }
+            throw error
+        }
+        engine.adoptStoredKey(reply["info"]["stored_session_id"].text)
+        let summary = reply["summary"]
+        let reason = [reply["message"], summary["note"], summary["headline"]].lazy.compactMap(Self.words).first
+        switch reply["status"].text {
+        case "compressed" where reply["removed"].integer != 0:
+            break
+        case "compressed", "aborted":
+            return .unchanged(reason)
+        case "pending":
+            compactionPending = true
+            return .unchanged(reason)
+        case nil where reply["lock_held"].flag == true:
+            return .unchanged(reason)
+        default:
+            forgetHistoryUntilRebuild()
+            throw BotFailure.unsupported
+        }
+        let compacted = Compression.compacted(headline: Self.words(summary["headline"]), tokenLine: Self.words(summary["token_line"]))
+        guard attempt == engine.generation else { return compacted }
+        compactionPending = false
+        historyRefresh?.cancel()
+        history = HermesTranscriptHistory()
+        await showCompactedHistory(attempt: attempt)
+        return compacted
+    }
+
+    /// Reads the newest page into a history started again, and shows it in place of the
+    /// transcript, compaction card included, if the chat is still idle on the same attach.
+    private func showCompactedHistory(attempt: Int) async {
+        await readNewestRows(attempt: attempt)
+        guard attempt == engine.generation, isIdle else { return }
+        if let historyFailure {
+            delegate?.hermesHistoryDidFail(BotConnectionAdvice.message(for: historyFailure, address: engine.connection.address))
+        } else {
+            delegate?.hermesReplaceTranscript(historyTranscript())
+        }
+    }
+
+    /// The compute host finished a `/compress` it answered `pending` to: the history starts
+    /// again from the newest page, shown now if idle, or taken by the running turn's end.
+    private func pendingCompactionDidFinish() {
+        compactionPending = false
+        historyRefresh?.cancel()
+        history = HermesTranscriptHistory()
+        let attempt = engine.generation
+        historyRefresh = Task { [weak self] in await self?.showCompactedHistory(attempt: attempt) }
+    }
+
+    /// A compaction whose answer was lost may have archived or re-numbered every row held, so
+    /// merging the newest page into them could show turns twice: the history starts again,
+    /// and the next attach reads the newest page and rebuilds the transcript from it, whether
+    /// the lost answer's recovery reattaches now or the chat already left.
+    private func forgetHistoryUntilRebuild() {
+        historyRefresh?.cancel()
+        history = HermesTranscriptHistory()
+        needsRebuild = true
+    }
+
+    /// A reply's text, or nil when it is missing or blank.
+    private static func words(_ value: BotJSON) -> String? {
+        value.text.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+    }
+
     /// One history write on `runtime`, sent once. Throws `NotSent` when it never went out; a
     /// reaped runtime (4001) also reattaches.
     private func writeOnce(_ call: HermesCall, runtime: String) async throws -> BotJSON {
@@ -629,6 +735,9 @@ struct HermesChatTranscript: Equatable {
             }
         case "request.cancel":
             requests.cancel(payload)
+        case "status.update":
+            // The compute host's late answer to a `pending` compaction (#1050).
+            if compactionPending, payload["kind"].text == "compacted" { pendingCompactionDidFinish() }
         case "btw.complete", "background.complete", "session.control.update":
             sideTasks.receive(frame)
         default:
@@ -640,6 +749,9 @@ struct HermesChatTranscript: Equatable {
 
     private func applyInfo(_ info: BotJSON) {
         if let model = info["model"].text, !model.isEmpty { delegate?.hermesApplyModel(model) }
+        // A legacy compaction, `/compress` or mid-turn, moves the session to a new key (#1050).
+        engine.adoptStoredKey(info["stored_session_id"].text)
+        noteInfo(info)
         // A rename on this runtime (`/title`, #1048) reports the new title here.
         if let title = info["title"].text, !title.isEmpty, title != infoTitle {
             infoTitle = title
@@ -693,6 +805,14 @@ struct HermesChatTranscript: Equatable {
         if !hostRunning { finish(ending) }
     }
 
+    /// Keeps the working folder and the model a `session.info` or a snapshot's `info` reports.
+    private func noteInfo(_ info: BotJSON) {
+        if let folder = Self.words(info["cwd"]) { cwd = folder }
+        if let model = Self.words(info["model"]), let provider = Self.words(info["provider"]) {
+            reportedModel = HermesCall.Model(id: model, provider: provider)
+        }
+    }
+
     /// Settles the turn against an attach's snapshot, then rebuilds the transcript from the
     /// history and it when frames were lost. Without a rebuild the replay already continued
     /// the turn.
@@ -703,6 +823,7 @@ struct HermesChatTranscript: Equatable {
         queuedPrompt = snapshot["queued"]["user"].text.flatMap { $0.isEmpty ? nil : $0 }
         requests.didReadSnapshot(snapshot)
         if let model = snapshot["info"]["model"].text, !model.isEmpty { delegate?.hermesApplyModel(model) }
+        noteInfo(snapshot["info"])
         // Ahead of the turn below, so its Live Activity starts under the session's title.
         if let title = snapshot["info"]["title"].text, !title.isEmpty { applyTitle(title) }
         if activeStreamID != nil, !running || (startedAt != nil && turnStartedAt != nil && startedAt != turnStartedAt) {
@@ -1114,7 +1235,11 @@ extension HermesChatTurnCoordinator: HermesConversationOwner {
     /// A rebuild reads the newest history rows first, while the engine still holds the frames.
     func conversationDidReadSnapshot(_ snapshot: BotJSON, runtime: String, attempt: Int) async throws {
         guard engine.isCurrent(snapshot) else { throw BotFailure.unsupported }
-        if engine.replayWasReset || needsRebuild { await readNewestRows(attempt: attempt) }
+        if engine.replayWasReset || needsRebuild {
+            // A pending compaction may have finished among the frames lost.
+            if compactionPending { history = HermesTranscriptHistory() }
+            await readNewestRows(attempt: attempt)
+        }
         try engine.check(attempt)
         reconcile(with: snapshot)
     }
