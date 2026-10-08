@@ -74,6 +74,14 @@ struct HermesTranscriptHistory: Equatable {
         return !older.isEmpty
     }
 
+    /// Drops row `id` and every row after it, as the host's rewind did (#1049). The rows the
+    /// host saved since are unknown, so the next older page waits for a newest read.
+    mutating func cut(before id: Int) {
+        guard let index = rows.firstIndex(where: { Self.id($0) == id }) else { return }
+        replace(with: Array(rows[..<index]))
+        needsRecount = true
+    }
+
     private mutating func replace(with rows: [BotJSON]) {
         self.rows = rows
         ids = Set(rows.compactMap(Self.id))
@@ -94,7 +102,8 @@ struct HermesCompaction: Equatable {
 /// `BotTranscriptProjection`, which reads `session.resume`'s snapshot rows.
 ///
 /// A row's message id is `<stored key>/row-<id>` and its `rowID` the host's id, so a reload, a
-/// turn's end and a later cache agree on identity. A `tool` row carries the full output; it joins
+/// turn's end and a later cache agree on identity; a row compaction archived (`active` 0) is
+/// `isCompacted`, since the host cuts only in its live history (#1049). A `tool` row carries the full output; it joins
 /// the call its assistant row declared (`tool_calls`, matched by `tool_call_id`), named by the
 /// host's `tool_call_labels` when it sent any. Tool rows and reasoning settle in front of the next
 /// message, as in Bot Chat. `display_kind` is open: `hidden` never shows, a steer is unwrapped,
@@ -181,7 +190,8 @@ enum HermesTranscriptProjection {
                     messageId: id,
                     displayKind: steer != nil ? ChatMessage.steerDisplayKind : kind ?? (skill == nil ? nil : "skill_invocation"),
                     displayMetadata: row["display_metadata"].argumentDictionary,
-                    rowID: rowID
+                    rowID: rowID,
+                    isCompacted: row["active"].integer == 0
                 ))
             default:
                 continue
