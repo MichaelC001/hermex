@@ -297,6 +297,9 @@ struct ChatView: View {
     /// A Hermes session's chat (#1010): webui-only controls are hidden and its turns run
     /// on the gateway socket.
     let isHermesSession: Bool
+    /// The parent the row this Hermes chat opened from named, which its "Forked from" row
+    /// checks (#1051).
+    let hermesParentKey: String?
     /// Puts a new Hermes chat in this one's place: a Profile picked before anything was
     /// sent (#1015). Nil pushes it on top instead.
     let onReplaceHermesSession: ((HermesSessionChat) -> Void)?
@@ -337,7 +340,8 @@ struct ChatView: View {
     @State private var pushedHermesSession: HermesSessionChat?
     /// The Sessions list `/sessions` or `/resume` pushed when no list is under this chat (#1053).
     @State private var pushedHermesSessionList: HermesSessionListEntry?
-    /// Set when this chat is a fork; draws the "Forked from" row.
+    /// Set when this webui chat is a fork; draws the "Forked from" row. A Hermes chat's is
+    /// its view model's (`shownForkOrigin`).
     @State private var forkOrigin: ForkOrigin?
     @State private var isOpeningForkParent = false
     @State private var editContext: MessageActionContext?
@@ -447,6 +451,7 @@ struct ChatView: View {
         self.restoresDraftSettings = restoresDraftSettings
         self.onConversationStarted = onConversationStarted
         isHermesSession = hermesSession != nil
+        hermesParentKey = hermesSession?.parentKey
         self.onReplaceHermesSession = onReplaceHermesSession
         hermesTranscriber = hermesSession.map { HermesTranscription.transcriber(for: $0) }
         self.onOpenHermesSessions = onOpenHermesSessions
@@ -1842,7 +1847,7 @@ struct ChatView: View {
             onOpenTurnFileDiff: { file in
                 turnDiffPresentation = .turnFiles(turnChangesRecapSummary?.diffFiles ?? [file], initial: file)
             },
-            forkOrigin: forkOrigin,
+            forkOrigin: shownForkOrigin,
             onOpenForkParent: openForkParent
         )
         // Off the main body chain, which is at the type-checker's limit.
@@ -1850,7 +1855,7 @@ struct ChatView: View {
             handleLatestRunOutcomeChange(viewModel.latestRunOutcome)
         }
         .task(id: session.sessionId) {
-            resolveForkOrigin()
+            await resolveForkOrigin()
         }
         .onChange(of: viewModel.messages.isEmpty, initial: true) { _, isEmpty in
             if !isEmpty { endSessionOpenSignpost() }
@@ -2877,6 +2882,10 @@ struct ChatView: View {
     }
 
     private func forkFromMessage(_ context: MessageActionContext) async {
+        if isHermesSession {
+            if let branch = await viewModel.forkHermesSession(from: context) { pushedHermesSession = branch }
+            return
+        }
         let session = await viewModel.forkFromMessage(context, modelContext: modelContext)
 
         if let lastError = viewModel.lastError {
@@ -2888,9 +2897,20 @@ struct ChatView: View {
         }
     }
 
+    /// The "Forked from" row this chat draws. A Hermes branch's comes from its host, which the
+    /// view model asks again on a later connect when the first attach failed (#1051).
+    private var shownForkOrigin: ForkOrigin? {
+        isHermesSession ? viewModel.hermesForkOrigin : forkOrigin
+    }
+
     /// Reads the parent's title from the active server's session cache, which
-    /// the session list writes on every load. Only forks do the lookup.
-    private func resolveForkOrigin() {
+    /// the session list writes on every load. Only forks do the lookup. A Hermes
+    /// branch asks its host instead (#1051).
+    private func resolveForkOrigin() async {
+        if isHermesSession {
+            await viewModel.checkHermesForkParent(hermesParentKey)
+            return
+        }
         guard let parentID = ForkOrigin.parentSessionID(of: session) else {
             forkOrigin = nil
             return
@@ -2902,7 +2922,11 @@ struct ChatView: View {
     /// Pushes the fork's parent: the cached one at once, otherwise after
     /// fetching it. A failed fetch shows the message-action error and stays here.
     private func openForkParent() {
-        guard let forkOrigin, !isOpeningForkParent else { return }
+        guard let forkOrigin = shownForkOrigin, !isOpeningForkParent else { return }
+        if isHermesSession {
+            pushedHermesSession = forkOrigin.parent.flatMap(viewModel.hermesChat(opening:))
+            return
+        }
         if let parent = forkOrigin.parent {
             pushedSession = parent
             return
