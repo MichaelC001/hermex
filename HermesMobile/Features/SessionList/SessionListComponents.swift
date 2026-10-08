@@ -104,12 +104,19 @@ struct SessionListRowActions {
 /// rename, archive, delete, Export as JSON and Move to Project (#1052). Duplicate waits on a
 /// later slice of #702; the host has no HTML export, and Hermes deep links are #706.
 enum SessionRowActionPolicy {
+    /// Pin, rename, move, archive and delete. A bot's Bot Chat, which a Hermes search lists
+    /// (#1053), belongs to its bot: pinning would also unhide it, and renaming orphans it.
     static func offersMutationActions(for session: SessionSummary) -> Bool {
-        !session.isSessionReadOnly
+        !session.isSessionReadOnly && session.hermes?.isBotChat != true
     }
 
     static func offersProjectMove(for session: SessionSummary) -> Bool {
         offersMutationActions(for: session)
+    }
+
+    /// Not on an archived match a Hermes search lists (#1053): the Archived screen restores it.
+    static func offersArchive(for session: SessionSummary) -> Bool {
+        offersMutationActions(for: session) && session.archived != true
     }
 
     /// "No project" in the Move menu. A Hermes session always works in some folder, so it can
@@ -660,7 +667,8 @@ struct SessionInteractiveRow: View {
                 isViewingCachedData: viewModel.isViewingCachedData,
                 isUnread: viewModel.isUnread(session),
                 attentionState: viewModel.attentionState(for: session),
-                searchExcerpt: viewModel.searchExcerpt(for: session, searchText: searchText)
+                searchExcerpt: viewModel.searchExcerpt(for: session, searchText: searchText),
+                labelsArchived: true
             )
         }
         .buttonStyle(.plain)
@@ -712,13 +720,15 @@ struct SessionInteractiveRow: View {
     @ViewBuilder
     private func sessionTrailingSwipeActions(for session: SessionSummary) -> some View {
         if canShowSessionMutationActions(for: session) {
-            Button {
-                actions.archive(session)
-            } label: {
-                Label("Archive", systemImage: "archivebox")
+            if SessionRowActionPolicy.offersArchive(for: session) {
+                Button {
+                    actions.archive(session)
+                } label: {
+                    Label("Archive", systemImage: "archivebox")
+                }
+                .disabled(viewModel.isMutating(session))
+                .tint(.orange)
             }
-            .disabled(viewModel.isMutating(session))
-            .tint(.orange)
 
             Button {
                 actions.delete(session)
@@ -967,12 +977,14 @@ struct SessionRowContextMenu: View {
         exportMenu
 
         if SessionRowActionPolicy.offersMutationActions(for: session) {
-            Button {
-                actions.archive(session)
-            } label: {
-                Label("Archive", systemImage: "archivebox")
+            if SessionRowActionPolicy.offersArchive(for: session) {
+                Button {
+                    actions.archive(session)
+                } label: {
+                    Label("Archive", systemImage: "archivebox")
+                }
+                .disabled(!canShowSessionMutationActions || isMutating)
             }
-            .disabled(!canShowSessionMutationActions || isMutating)
 
             Button(role: .destructive) {
                 actions.delete(session)
