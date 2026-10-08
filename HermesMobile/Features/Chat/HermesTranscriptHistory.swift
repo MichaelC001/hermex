@@ -18,6 +18,8 @@ struct HermesTranscriptHistory: Equatable {
     /// A full older page added nothing: rows the chat never counted pushed the rows held into
     /// it. The next page waits until the newest rows are read again.
     private(set) var needsRecount = false
+    /// What the last newest read covered, for the offline cache (#1054); nil until one succeeds.
+    private(set) var newestCoverage: HermesNewestCoverage?
 
     /// Where the next older page starts: the display rows held and the newer ones, counted
     /// from the newest.
@@ -38,6 +40,8 @@ struct HermesTranscriptHistory: Equatable {
     mutating func mergeNewest(_ fresh: [BotJSON], reachedStart: Bool) {
         var seen = Set<Int>()
         let fresh = fresh.filter { Self.id($0).map { seen.insert($0).inserted } == true }
+        let freshIDs = fresh.compactMap(Self.id)
+        newestCoverage = reachedStart ? .all : freshIDs.isEmpty ? nil : .from(rowIDs: freshIDs)
         if !reachedStart, let shared = rows.firstIndex(where: { Self.id($0).map(seen.contains) == true }) {
             replace(with: rows[..<shared].filter { Self.id($0).map(seen.contains) == false } + fresh)
         } else {
@@ -88,6 +92,16 @@ struct HermesTranscriptHistory: Equatable {
     }
 
     static func id(_ row: BotJSON) -> Int? { row["id"].integer }
+}
+
+/// The part of a Hermes transcript a newest read covered (#1054): every row once it reached the
+/// first, else its rows, oldest first, and every row the host shows after them. Ids don't follow
+/// display order (a compaction re-inserts the first rows under new ids), so the part is placed by
+/// position, never by an id range. A row the offline cache holds there, which the read lacks, was
+/// cut on the host, by a rewind or an undo.
+enum HermesNewestCoverage: Equatable {
+    case all
+    case from(rowIDs: [Int])
 }
 
 /// Where a compacted Hermes session's "Context compaction · Reference only" card sits (#1047):

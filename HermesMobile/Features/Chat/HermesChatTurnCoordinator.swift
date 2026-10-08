@@ -16,8 +16,13 @@ import SwiftData
     /// Puts an older page of settled history in front (#1047). The rows on screen and the
     /// running turn stay as they are.
     func hermesPrependHistory(_ transcript: HermesChatTranscript)
-    /// A history read failed: the transcript keeps what it shows, and the chat says why (#1047).
-    func hermesHistoryDidFail(_ message: String)
+    /// A history read failed with `error`: the transcript keeps what it shows, and the chat says
+    /// why in `message` (#1047), or, with nothing on screen and the host out of reach, shows the
+    /// offline cache's copy (#1054).
+    func hermesHistoryDidFail(_ error: Error, message: String)
+    /// An attach failed with `error`; the engine may be retrying. A host it can't reach shows
+    /// the offline cache's copy (#1054).
+    func hermesAttachDidFail(_ error: Error)
     func hermesApplyUsage(_ usage: ContextWindowSnapshot)
     /// The model `session.info` reports: the Profile's default unless the host says otherwise.
     func hermesApplyModel(_ model: String)
@@ -62,6 +67,8 @@ struct HermesChatTranscript: Equatable {
     /// The running turn's unsaved reply, which the next deltas continue.
     var streamingReply: ChatMessage?
     var title: String?
+    /// What the last newest read covered, for the offline cache (#1054).
+    var newestCoverage: HermesNewestCoverage?
 }
 
 /// Runs a Hermes session's turns in the main chat (#1010). It owns the session's
@@ -561,7 +568,7 @@ struct HermesChatTranscript: Equatable {
         await readNewestRows(attempt: attempt)
         guard attempt == engine.generation, isIdle else { return }
         if let historyFailure {
-            delegate?.hermesHistoryDidFail(BotConnectionAdvice.message(for: historyFailure, address: engine.connection.address))
+            reportHistoryFailure(historyFailure)
         } else {
             delegate?.hermesReplaceTranscript(historyTranscript())
         }
@@ -869,7 +876,7 @@ struct HermesChatTranscript: Equatable {
         let projected = HermesTranscriptProjection.project(history.rows, root: engine.storedKey ?? "")
         return HermesChatTranscript(messages: projected.messages.map(Self.displayed), toolCallGroups: projected.toolCallGroups,
                                     reasoningGroups: projected.reasoningGroups, compaction: projected.compaction,
-                                    hasOlder: history.hasOlder)
+                                    hasOlder: history.hasOlder, newestCoverage: history.newestCoverage)
     }
 
     /// One transcript page from `offset` under the attach `attempt` began. A session the host
@@ -971,7 +978,7 @@ struct HermesChatTranscript: Equatable {
             return added
         } catch {
             if attempt == engine.generation, !Task.isCancelled {
-                delegate?.hermesHistoryDidFail(BotConnectionAdvice.message(for: error, address: engine.connection.address))
+                reportHistoryFailure(error)
             }
             return false
         }
@@ -985,7 +992,7 @@ struct HermesChatTranscript: Equatable {
         await readNewestRows(attempt: attempt)
         guard attempt == engine.generation, isIdle else { return }
         if let historyFailure {
-            delegate?.hermesHistoryDidFail(BotConnectionAdvice.message(for: historyFailure, address: engine.connection.address))
+            reportHistoryFailure(historyFailure)
         } else {
             delegate?.hermesReplaceTranscript(historyTranscript())
         }
@@ -993,6 +1000,11 @@ struct HermesChatTranscript: Equatable {
 
     /// A newest read failed and none has succeeded since.
     var hasHistoryFailure: Bool { historyFailure != nil }
+
+    /// Tells the chat a history read failed, with the connection's advice.
+    private func reportHistoryFailure(_ error: Error) {
+        delegate?.hermesHistoryDidFail(error, message: BotConnectionAdvice.message(for: error, address: engine.connection.address))
+    }
 
     /// Reattaches so the next attach re-reads the newest rows and rebuilds the transcript:
     /// frames were lost mid-turn.
@@ -1244,13 +1256,21 @@ extension HermesChatTurnCoordinator: HermesConversationOwner {
         reconcile(with: snapshot)
     }
 
+    /// An attach that failed before any newest read succeeded makes the next one read and
+    /// rebuild: one that failed after the host named the runtime leaves the next attach, on
+    /// the same runtime, no lost frames to rebuild for, and the history would go unread.
+    func conversationDidFailToAttach(_ error: Error) {
+        if history.newestCoverage == nil { needsRebuild = true }
+        delegate?.hermesAttachDidFail(error)
+    }
+
     func conversationDidConnect(runtime: String, attempt: Int) async throws {
         // The engine released the held frames just before this.
         heldFrames = []; deltasInRebuild = []; replayedReply = ""
         refusedSignIn = false
         delegate?.hermesConnectionDidChange(failure: nil)
         if let historyFailure {
-            delegate?.hermesHistoryDidFail(BotConnectionAdvice.message(for: historyFailure, address: engine.connection.address))
+            reportHistoryFailure(historyFailure)
         }
         sideTasks.didConnect(runtime: runtime, attempt: attempt)
         // Off the attach's path: the chips and the `/` panel fill in once their catalogs answer.

@@ -200,9 +200,13 @@ final class SessionListViewModel {
     /// Each content match's snippet, its `>>>`/`<<<` marks and all, by row identity.
     private var hermesSearchSnippets: [String: String] = [:]
     /// A Hermes search that ran before the list's socket was attached, as one a list opened
-    /// searching starts, or one whose matches went stale when the socket closed or the user
-    /// pulled to refresh; the list's next connect or refresh runs it.
+    /// searching starts or one run while it showed cached rows, or one whose matches went stale
+    /// when the socket closed or the user pulled to refresh; the list's next connect or refresh
+    /// runs it.
     @ObservationIgnored private var hermesSearchAwaitsConnect = false
+    /// The offline cache the list's pages are written to and read back from while its host
+    /// can't be reached (#1054), from the screen's `openHermes(modelContext:)`.
+    @ObservationIgnored private var hermesCache: ModelContext?
 
     /// `hermes` makes this a Hermes server's list; nothing then reaches the webui API.
     init(server: URL, client: APIClient? = nil, unreadStore: SessionUnreadStore = SessionUnreadStore(),
@@ -555,6 +559,8 @@ final class SessionListViewModel {
 
         guard !query.isEmpty, !isViewingCachedData else {
             isSearchingRemoteSessions = false
+            // A Hermes list showing cached rows asks the host once a read replaces them.
+            if hermes != nil, !query.isEmpty { hermesSearchAwaitsConnect = true }
             return
         }
 
@@ -1725,9 +1731,12 @@ final class SessionListViewModel {
     /// Shows the Hermes Profile's list and keeps it current while it is on screen: connects
     /// to the shared socket, names the Profile so the host watches its store, reads the list
     /// and its live states, and reloads on `sessions.changed`. A list a chat covered keeps its
-    /// socket and only reads again. Also the pull-to-refresh and foreground path.
-    func openHermes() async {
+    /// socket and only reads again. Also the pull-to-refresh and foreground path. Each page
+    /// read goes to `modelContext`, the offline cache, which the list shows, read-only, while
+    /// the host can't be reached (#1054); the list keeps it for the reads it makes on its own.
+    func openHermes(modelContext: ModelContext? = nil) async {
         guard let hermes else { return }
+        if let modelContext { hermesCache = modelContext }
         hermesIsListening = true
         let followed = followSavedHermesProfile()
         if let wire = hermesWire {
@@ -1763,6 +1772,7 @@ final class SessionListViewModel {
             guard hermesWire === wire else { return }
             // The screen left while connecting: the next open starts a fresh client.
             if Task.isCancelled { wire.close(); hermesWire = nil; isLoading = false; return }
+            showCachedHermesSessions(after: error)
             dropHermes(error)
         }
     }
@@ -1789,9 +1799,9 @@ final class SessionListViewModel {
 
     /// Pull to refresh: the list reads again, and so does the active search, whose matches
     /// past the loaded pages (one another device deleted, say) change only when it runs again.
-    func refreshHermes() async {
+    func refreshHermes(modelContext: ModelContext? = nil) async {
         if activeRemoteSearchQuery?.isEmpty == false { hermesSearchAwaitsConnect = true }
-        await openHermes()
+        await openHermes(modelContext: modelContext)
     }
 
     /// Shows `profile`'s sessions, and remembers it as the server's pick, which the composer's
@@ -1858,11 +1868,13 @@ final class SessionListViewModel {
             if isLoadingMoreSessions { isLoadingMoreSessions = false }
             startHermesStatusRead(wire)
             await readHermesProjects(wire, readSerial: serial)
+            await runAwaitedHermesSearch()
         } catch {
             guard serial == hermesReadSerial, hermesWire === wire, !Task.isCancelled else { return }
             // The client left the socket without a word (a call its screen cancelled): reconnect.
             if error as? BotFailure == .stale { return dropHermes(error) }
             if error as? BotFailure == .rejected(404), await moveOffRemovedHermesProfile(wire) { return }
+            if showCachedHermesSessions(after: error) { return }
             showHermesFailure(error)
         }
     }
@@ -1881,7 +1893,55 @@ final class SessionListViewModel {
         }
         hermesReturnedFrom = []
         if sessions != rows { sessions = rows }
+        if isViewingCachedData { isViewingCachedData = false }
         errorMessage = nil; sessionLoadError = nil
+        cacheHermesRows(rows, reachedEnd: !pages.hasMore)
+    }
+
+    /// Writes the rows read so far to the offline cache; `reachedEnd` when they run from the
+    /// list's first page to its end.
+    private func cacheHermesRows(_ rows: [SessionSummary], reachedEnd: Bool) {
+        guard let hermesCache, let profile = hermesProfile else { return }
+        do {
+            try CacheStore.cacheHermesSessions(rows, profile: profile, reachedEnd: reachedEnd, serverURL: server, in: hermesCache)
+        } catch {
+            cacheErrorMessage = error.localizedDescription
+        }
+    }
+
+    /// A list read that failed because the host can't be reached shows the Profile's cached
+    /// rows instead, read-only (`isViewingCachedData`), until a read succeeds. Search then reads
+    /// only them, so the host's matches go, and the active search asks the host again once a
+    /// read succeeds. False when it can't: another failure, or nothing cached.
+    @discardableResult
+    private func showCachedHermesSessions(after error: Error) -> Bool {
+        guard CacheFallbackPolicy.shouldUseCache(for: error), let hermesCache, let profile = hermesProfile else { return false }
+        let cached: [SessionSummary]
+        do {
+            cached = try CacheStore.cachedHermesSessions(serverURL: server, profile: profile, in: hermesCache)
+        } catch {
+            cacheErrorMessage = error.localizedDescription
+            return false
+        }
+        guard !cached.isEmpty else { return false }
+        if sessions != cached { sessions = cached }
+        hasMoreSessions = false
+        isViewingCachedData = true
+        errorMessage = nil; sessionLoadError = nil
+        setHermesStates([:])
+        clearHermesSearchMatches()
+        if activeRemoteSearchQuery?.isEmpty == false { hermesSearchAwaitsConnect = true }
+        return true
+    }
+
+    /// Drops a session this phone deleted or archived in `profile` from the offline cache.
+    private func forgetCachedHermesSession(_ session: SessionSummary, in profile: String?) {
+        guard let hermesCache, let root = session.hermes?.lineageRoot, let profile else { return }
+        do {
+            try CacheStore.removeHermesSession(lineageRoot: root, profile: profile, serverURL: server, in: hermesCache)
+        } catch {
+            cacheErrorMessage = error.localizedDescription
+        }
     }
 
     /// The rows `pages` hold, each in the project lane that claims it.
@@ -1941,7 +2001,7 @@ final class SessionListViewModel {
         hermesProfile = profile
         hermesPages = HermesSessionPages()
         hermesReadSerial += 1
-        sessions = []; hasMoreSessions = false; isLoadingMoreSessions = false
+        sessions = []; hasMoreSessions = false; isLoadingMoreSessions = false; isViewingCachedData = false
         hermesUnreadMarks = [:]; hermesReturnedFrom = []
         projects = []; hermesProjectOwners = [:]; hermesProjectsRead = false
         clearHermesSearchMatches()
@@ -1960,7 +2020,7 @@ final class SessionListViewModel {
               saved != hermesProfile, hermesProfiles.contains(saved) else { return false }
         hermesProfile = saved
         hermesPages = HermesSessionPages()
-        sessions = []; hasMoreSessions = false
+        sessions = []; hasMoreSessions = false; isViewingCachedData = false
         hermesUnreadMarks = [:]; hermesReturnedFrom = []
         projects = []; hermesProjectOwners = [:]; hermesProjectsRead = false
         clearHermesSearchMatches()
@@ -2174,6 +2234,7 @@ final class SessionListViewModel {
         showHermesPages(pages, animation: animation)
         do {
             try await wire.updateSession(change, key: key, profile: profile)
+            if change == .archived(true) { forgetCachedHermesSession(session, in: listed) }
             applyToHermesSearch(change, key: key)
             requestHermesReload()
             return true
@@ -2195,6 +2256,7 @@ final class SessionListViewModel {
     private func deleteHermesSession(_ session: SessionSummary, animation: Animation?) async -> Bool {
         guard let target = hermesTarget(session), beginSessionMutation(target.key) else { return false }
         let (wire, key, profile) = target
+        let listed = hermesProfile
         defer { endSessionMutation(key) }
         actionErrorMessage = nil
         do {
@@ -2203,6 +2265,7 @@ final class SessionListViewModel {
                 actionErrorMessage = refusal
                 return false
             }
+            forgetCachedHermesSession(session, in: listed)
             hermesReadSerial += 1
             var pages = hermesPages
             pages.remove(key)
