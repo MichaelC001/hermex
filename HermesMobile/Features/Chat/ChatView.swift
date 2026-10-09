@@ -1126,11 +1126,16 @@ struct ChatView: View {
             }
             .sheet(item: $openedFileReference, content: fileReferenceSheet)
             // A file link or Git sheet opened in a Hermes chat's old folder reads through the old
-            // client: close it, and read the new folder's repository (#1114).
+            // client: close it, and read the new folder's repository (#1114). A Git action still
+            // running there, and its toast or alert, belong to the old repository (#1115).
             .onChange(of: viewModel.hermesWorkspace) {
                 openedFileReference = nil
                 activeGitSheet = nil
                 turnDiffPresentation = nil
+                gitAvailabilityViewModel.retire()
+                gitToastState.dismissProgress()
+                gitToastState.dismissSuccess()
+                gitAlert = nil
                 Task { await loadInitialGitAvailability() }
             }
             .sheet(item: $activeGitSheet, content: gitSheet)
@@ -1281,7 +1286,7 @@ struct ChatView: View {
         GitWriteAvailability(
             isStreaming: viewModel.activeStreamID != nil,
             isViewingCachedData: viewModel.isViewingCachedData,
-            hidesWrites: !gitAvailabilityViewModel.supportsWrites
+            hidesBranchesAndSync: !gitAvailabilityViewModel.supportsBranches
         )
     }
 
@@ -1296,8 +1301,7 @@ struct ChatView: View {
             )
         case .commit:
             GitCommitView(
-                session: session,
-                server: server,
+                git: gitAvailabilityViewModel.git,
                 writesDisabled: gitWriteAvailability.writesDisabled,
                 onAPIError: onAPIError,
                 onCommitted: {
@@ -1342,7 +1346,7 @@ struct ChatView: View {
             isEnabled: !viewModel.isViewingCachedData,
             fetchDisabled: gitWriteAvailability.fetchDisabled,
             writesDisabled: gitWriteAvailability.writesDisabled,
-            hidesWrites: gitWriteAvailability.hidesWrites,
+            hidesBranchesAndSync: gitWriteAvailability.hidesBranchesAndSync,
             isRunningAction: gitAvailabilityViewModel.isRunningGitAction,
             onTap: {
                 HapticButtonHaptics.tap(isEnabled: isHapticsEnabled)
@@ -1386,7 +1390,7 @@ struct ChatView: View {
         ) else { return nil }
         return ChatInlineCommitContext(
             runningPhase: gitAvailabilityViewModel.commitPhase,
-            isDisabled: gitWriteAvailability.writesDisabled
+            isDisabled: gitWriteAvailability.writesDisabled || gitAvailabilityViewModel.isWriteLocked
         )
     }
 
@@ -1417,20 +1421,23 @@ struct ChatView: View {
         turnDiffPresentation = .turnFiles(files, initial: nil)
     }
 
+    /// Runs on the repository it started in: a folder change retires that one, and its outcome is
+    /// then `.retired`, with nothing to show.
     @MainActor
     private func performQuickCommit(push: Bool) async {
-        guard !gitAvailabilityViewModel.isCommitting else { return }
+        let git = gitAvailabilityViewModel
+        guard !git.isCommitting, !git.isWriteLocked else { return }
 
-        let branch = gitAvailabilityViewModel.currentBranchName
+        let branch = git.currentBranchName
         gitToastState.showProgress(GitActionProgress(
             title: GitCommitPhase.generatingMessage.progressTitle,
             subtitle: branch
         ))
 
-        let outcome = await gitAvailabilityViewModel.quickCommit(push: push) { phase in
+        let outcome = await git.quickCommit(push: push) { phase in
             gitToastState.showProgress(GitActionProgress(
                 title: phase.progressTitle,
-                subtitle: gitAvailabilityViewModel.currentBranchName
+                subtitle: git.currentBranchName
             ))
         }
 
@@ -1465,14 +1472,16 @@ struct ChatView: View {
             // busy/no-session guard returns with no message.) No success toast/SHA.
             gitToastState.dismissProgress()
             ChatHaptics.gitActionFinished(succeeded: false, isEnabled: isHapticsEnabled)
-            gitAlert = .error(gitAvailabilityViewModel.actionErrorMessage
+            gitAlert = .error(git.actionErrorMessage
                 ?? String(localized: "Too many changes to quick-commit. Commit in smaller batches, or use git directly."))
         case .failure:
             gitToastState.dismissProgress()
             ChatHaptics.gitActionFinished(succeeded: false, isEnabled: isHapticsEnabled)
-            if let message = gitAvailabilityViewModel.actionErrorMessage {
+            if let message = git.actionErrorMessage {
                 gitAlert = .error(message)
             }
+        case .retired:
+            break
         }
     }
 
@@ -1489,18 +1498,22 @@ struct ChatView: View {
         }
     }
 
+    /// Runs on the repository it started in, and shows nothing once a folder change retired it.
     @MainActor
     private func performGitRemoteAction(_ action: GitRemoteAction) async {
+        let git = gitAvailabilityViewModel
         gitToastState.showProgress(GitActionProgress(
             title: action.progressTitle,
-            subtitle: gitAvailabilityViewModel.currentBranchName
+            subtitle: git.currentBranchName
         ))
 
-        if await gitAvailabilityViewModel.performRemoteAction(action) {
+        let succeeded = await git.performRemoteAction(action)
+        guard !git.isRetired else { return }
+        if succeeded {
             gitToastState.showSuccess(GitActionSuccess(
                 title: action.successTitle,
-                subtitle: gitAvailabilityViewModel.currentBranchName,
-                detailLines: [gitAvailabilityViewModel.lastActionMessage]
+                subtitle: git.currentBranchName,
+                detailLines: [git.lastActionMessage]
                     .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
                     .filter { !$0.isEmpty }
             ))
@@ -1508,10 +1521,20 @@ struct ChatView: View {
         } else {
             gitToastState.dismissProgress()
             ChatHaptics.gitActionFinished(succeeded: false, isEnabled: isHapticsEnabled)
-            if let message = gitAvailabilityViewModel.actionErrorMessage {
+            if let message = git.actionErrorMessage {
                 gitAlert = .error(message)
             }
         }
+    }
+
+    /// webui pushes to the configured upstream. A Hermes host pushes there too, or to origin as
+    /// the branch's new upstream when it has none (#1115), so its copy names the branch and both.
+    private var pushConfirmationMessage: String {
+        guard !gitAvailabilityViewModel.supportsBranches else {
+            return String(localized: "Push the current branch to its configured upstream remote?")
+        }
+        let branch = gitAvailabilityViewModel.currentBranchName
+        return String(localized: "Push \(branch) to its upstream remote, or to origin as a new upstream branch if it has none?")
     }
 
     private func gitAlertPresentation(_ alert: GitChatAlert) -> Alert {
@@ -1520,8 +1543,8 @@ struct ChatView: View {
             return Alert(
                 title: Text(action == .pull ? "Pull Remote Changes?" : "Push Local Commits?"),
                 message: Text(action == .pull
-                    ? "Pull uses fast-forward only and will not create a merge commit."
-                    : "Push the current branch to its configured upstream remote?"),
+                    ? String(localized: "Pull uses fast-forward only and will not create a merge commit.")
+                    : pushConfirmationMessage),
                 primaryButton: .default(Text(action == .pull ? "Pull" : "Push")) {
                     Task { await performGitRemoteAction(action) }
                 },
@@ -2225,7 +2248,8 @@ struct ChatView: View {
     }
 
     /// A fresh Git state for the chat's repository: webui's session, or a Hermes chat's folder
-    /// while Files can read it (#1114), which has no writes. Without one, Git stays hidden.
+    /// while Files can read it (#1114), which has no branches, fetch or pull. Without one, Git
+    /// stays hidden.
     private func loadInitialGitAvailability() async {
         let availabilityViewModel = if isHermesSession {
             GitWorkspaceAvailabilityViewModel(

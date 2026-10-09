@@ -1498,7 +1498,7 @@ panel (#1113) and Git (#1114) read the same context.
   webui switch does not reload it: that switch is optimistic). A `complete.path` with no
   reply fails only that lookup, never the chat's connection; Bot Chat's still ends its
   connection, as before.
-- **Git, read-only (#1114).** The Git menu, Changes sheet, diffs and turn-changes card read
+- **Git reads (#1114).** The Git menu, Changes sheet, diffs and turn-changes card read
   through `HermesGitClient`, the `GitDataClient` beside webui's `WebUIGitClient`, mapped into
   webui's Git models. Same `local` gate as Files; a folder outside a repository hides Git. It
   shows the whole repository holding the `cwd`: `GET /api/fs/git-root?path=<cwd>` resolves the
@@ -1517,10 +1517,46 @@ panel (#1113) and Git (#1114) read the same context.
   leaves the path unmapped. A diff over 512 KiB shows webui's too-large notice, and a
   `Binary files … differ` patch the binary one. A failed git call is 400 `{detail}`, git's
   stderr: it reads as "Repository status unavailable", and neither it nor the root is shown or
-  logged. Every write (Stage Changes, Commit, Push, Fetch, Pull, the branch picker, the inline
-  commit button) is hidden; with the picker gone, the menu shows the branch and `↑ahead ↓behind`
-  as a row above Changes. The turn-end refresh and the Changes card work as on webui. A `cwd` or
-  backend change closes an open Git sheet and reads the new folder's repository.
+  logged. Fetch, Pull and the branch picker are webui-only and hidden; with the picker gone, the
+  menu shows the branch and `↑ahead ↓behind` as a row above Changes. The turn-end refresh and the
+  Changes card work as on webui. A `cwd` or backend change closes an open Git sheet and reads the
+  new folder's repository.
+- **Git writes (#1115).** Stage Changes, Commit, Commit & Push, Push and the inline commit button
+  go through `HermesGitClient` too, on `git/review/stage|unstage|revert|commit|push` with
+  `path=<root>`, each `{ok}` or 400 `{detail}`. The host guards none of it, so the client does.
+  Stage, unstage and revert always name one `file` (without one the host acts on the whole tree,
+  `git clean -fd .` included), sent as `:(literal)<path>`, since the host hands it to git as a
+  pathspec where `*` would reach other files; `HermesREST.isGitFile` refuses a blank, absolute,
+  `.` or `..` path. Each write reads `git/status` and `review/list` again and acts on the rows
+  matched by exact path, never trimmed: the host keeps an untracked name's spaces but trims a
+  tracked one's, so a path listed twice is refused. A conflicted row (including a `U` past the
+  status cap) can't be staged or discarded; a rename can't be discarded or unstaged (its row
+  names only the new path). A commit refuses with nothing staged (the host would `git add -A`) or with a
+  conflict; push refuses a detached HEAD, which the host skips silently. Discard unstages a staged
+  row, then reverts it, which deletes an untracked or newly added file. "Commit selected" is a
+  sequence (the host has no temporary index): unstage all, stage the selection, check something
+  is staged, commit, stage the other staged files again. `git add` restores only whole files, so
+  it is refused up front while a staged file is partly staged, may be (past the cap), or is a
+  rename, while a staged file's path is blank or listed twice, and before the first commit, where
+  the host's file-less unstage fails; a failure before the commit, once any of its writes went
+  out (a lost reply may hide that the reset ran), restores the staged files, and a failed restore
+  is reported (before the commit as
+  its own refusal, after it as "Committed, but some files couldn’t be staged again." with the
+  sha). After a commit `git/review/rev-parse` gives the sha (null before the first commit). Writes
+  belong to the chat (`HermesChatTurnCoordinator.gitWriteDispatch`): a write begun while a turn
+  runs, a message is sending or the screen shows cached data sends nothing, and each request
+  checks again as it goes out, also stopping once the chat reattached or left the folder. A
+  folder change also retires the chat's Git state (`GitWorkspaceAvailabilityViewModel.retire()`),
+  so a quick commit or push still running there shows no toast or alert in the new folder. The
+  Git menu and the commit sheet share one `GitWriteLock` per repository: while either writes (a
+  quick commit's message wait included), the other's write controls are disabled and its writes
+  refused. A suggested message is `commit-context`'s diff (or the selected files' `file-diff`s,
+  a new file's current content before the first commit, when that is empty), sent to
+  `llm.oneshot` with the `commit_message` template, `recent` as `recent_commits`, the chat's
+  runtime as `session_id`, temperature 0.8 as Desktop sends it, and the last suggestion as
+  `avoid` on Regenerate. Every write reads the status again, and so does a failed one (webui's
+  failed writes don't, and only a Hermes sheet shows the commit's sha: `GitDataClient.isHermes`).
+  A refusal reads as "Git couldn’t finish this change on your Hermes host.", never git's stderr.
 
 ## Memory on a Hermes host
 

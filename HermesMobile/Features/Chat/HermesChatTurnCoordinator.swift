@@ -436,11 +436,46 @@ struct HermesChatTranscript: Equatable {
         return HermesWorkspaceFileClient(context: workspace, http: http)
     }
 
-    /// The repository holding `workspace` (#1114), on this chat's connection. Git reads it only on a
-    /// local backend, as Files does.
-    var workspaceGit: HermesGitClient? {
+    /// The repository holding `workspace` (#1114), on this chat's connection, its commit messages
+    /// written on this chat's model and its writes owned by this chat (#1115,
+    /// `gitWriteDispatch`). `showsCachedData` is the screen's cached-data state, which also stops
+    /// a write. Git reads it only on a local backend, as Files does.
+    func workspaceGit(showsCachedData: @escaping @MainActor @Sendable () -> Bool) -> HermesGitClient? {
         guard let workspace, let http = (engine.wire as? BotClient)?.http else { return nil }
-        return HermesGitClient(context: workspace, http: http)
+        return HermesGitClient(context: workspace, http: http, writeMessage: { [weak self] diff, recent, avoid in
+            guard let self else { throw BotFailure.stale }
+            return try await self.commitMessage(diff: diff, recent: recent, avoid: avoid)
+        }, writeOwner: { [weak self] in
+            guard let self else { throw BotFailure.stale }
+            return try self.gitWriteDispatch(in: workspace, showsCachedData: showsCachedData)
+        })
+    }
+
+    /// `HermesGitClient.WriteOwner` for a repository client made for `workspace`: the check a
+    /// write's requests run as they go out, run once now. It throws `.turnRunning` while a turn
+    /// runs or a message is being sent, and `.stale` once the screen shows cached data, the chat
+    /// reattached since the write began, or its folder is no longer `workspace`.
+    private func gitWriteDispatch(in workspace: HermesWorkspaceContext,
+                                  showsCachedData: @escaping @MainActor @Sendable () -> Bool) throws -> HermesGitClient.Dispatch {
+        let attempt = engine.generation
+        let check: HermesGitClient.Dispatch = { [weak self] in
+            guard let self, self.engine.generation == attempt, self.workspace == workspace, !showsCachedData() else {
+                throw BotFailure.stale
+            }
+            guard self.isIdle else { throw HermesGitRefusal.turnRunning }
+        }
+        try check()
+        return check
+    }
+
+    /// A commit message for `diff` from the host's one-shot model call, on the attached runtime's
+    /// model. Throws `.stale` while detached, and for a reply that lands after a reattach.
+    func commitMessage(diff: String, recent: String, avoid: String?) async throws -> String {
+        guard engine.connectionState == .connected else { throw BotFailure.stale }
+        let reply = try await engine.request(.commitMessage(diff: diff, recentCommits: recent, avoid: avoid,
+                                                            sessionID: engine.runtime, profile: engine.target.profile),
+                                             attempt: engine.generation)
+        return reply["text"].text ?? ""
     }
 
     /// One query's rows for the composer's `@` panel and its `@path` check (#1113), as Bot Chat

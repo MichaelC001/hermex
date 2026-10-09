@@ -179,6 +179,27 @@ enum HermesREST: Equatable, Sendable {
     case gitDiff(repository: String, file: String, staged: Bool)
     /// `{diff}`: one file's whole change against HEAD, staged and worktree edits together.
     case gitFileDiff(repository: String, file: String)
+    // Repository writes (#1115): each answers `{ok}`, or 400 `{detail}` with git's stderr. The
+    // host hands `file` to git as a pathspec, where `*` matches other files and `.` or no file the
+    // whole tree, so a file goes out literal (`:(literal)file`) and one that isn't a single
+    // repository-relative path (`isGitFile`) is refused here.
+    /// `git add -- file`. Without a file the host runs `git add -A`, so one is always named.
+    case gitStage(repository: String, file: String)
+    /// `git reset -q HEAD [-- file]`; nil unstages everything, which leaves the worktree alone.
+    case gitUnstage(repository: String, file: String?)
+    /// `git checkout HEAD -- file` then `git clean -fd -- file`: back to HEAD, deleting it when
+    /// untracked. Without a file the host does that to the whole tree, so one is always named.
+    case gitRevert(repository: String, file: String)
+    /// `git commit -m message`, never pushing. With nothing staged the host runs `git add -A`
+    /// first, so `HermesGitClient` checks the staged count before sending it.
+    case gitCommit(repository: String, message: String)
+    /// Pushes to the upstream, or `-u origin <branch>` without one; does nothing on a detached HEAD.
+    case gitPush(repository: String)
+    /// `{sha}`: HEAD's full sha, or null before the first commit.
+    case gitHead(repository: String)
+    /// `{diff, recent}`: what a commit would take (the staged diff, else everything against HEAD,
+    /// with untracked names appended) and the last ten subjects, for a commit message.
+    case gitCommitContext(repository: String)
     /// Replaces or creates the file at a host path, atomically; `{ok, path, byteSize}`. It never
     /// creates folders: a missing parent is 400 "Parent directory does not exist".
     case fsWriteText(path: String, content: String)
@@ -431,6 +452,21 @@ enum HermesREST: Equatable, Sendable {
         case .gitFileDiff(let repository, let file):
             return try Self.pathQuery(base, "api/git/file-diff", [URLQueryItem(name: "path", value: repository),
                                                                   URLQueryItem(name: "file", value: file)])
+        case .gitStage(let repository, let file):
+            return try Self.gitWrite(base, "api/git/review/stage", repository: repository, file: file)
+        case .gitUnstage(let repository, let file):
+            return try Self.gitWrite(base, "api/git/review/unstage", repository: repository, file: file)
+        case .gitRevert(let repository, let file):
+            return try Self.gitWrite(base, "api/git/review/revert", repository: repository, file: file)
+        case .gitCommit(let repository, let message):
+            return try Self.send("POST", base.appendingPathComponent("api/git/review/commit"),
+                                 ["path": .string(repository), "message": .string(message), "push": .bool(false)])
+        case .gitPush(let repository):
+            return try Self.send("POST", base.appendingPathComponent("api/git/review/push"), ["path": .string(repository)])
+        case .gitHead(let repository):
+            return try Self.pathQuery(base, "api/git/review/rev-parse", [URLQueryItem(name: "path", value: repository)])
+        case .gitCommitContext(let repository):
+            return try Self.pathQuery(base, "api/git/review/commit-context", [URLQueryItem(name: "path", value: repository)])
         case .fsWriteText(let path, let content):
             return try Self.send("POST", base.appendingPathComponent("api/fs/write-text"),
                                  ["path": .string(path), "content": .string(content)])
@@ -593,6 +629,24 @@ enum HermesREST: Equatable, Sendable {
     }
 
     /// One path segment of the host's own id characters, so an id never names another route.
+    /// Whether `file` names one path inside a repository, as a Git write's `file` must: not blank,
+    /// not absolute, no `.` or `..` part, and no empty part but a folder's trailing slash
+    /// (`Sources/`, as an untracked folder's row names it).
+    static func isGitFile(_ file: String) -> Bool {
+        guard !file.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        var parts = file.split(separator: "/", omittingEmptySubsequences: false)
+        if parts.count > 1, parts.last == "" { parts.removeLast() }
+        return parts.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
+    }
+
+    /// A Git review write at `repository`, its `file` literal (`isGitFile`); nil only unstages.
+    private static func gitWrite(_ base: URL, _ route: String, repository: String, file: String?) throws -> URLRequest {
+        guard !repository.isEmpty, file.map(isGitFile) != false else { throw BotFailure.invalidAddress }
+        var body: [String: BotJSON] = ["path": .string(repository)]
+        if let file { body["file"] = .string(":(literal)" + file) }
+        return try send("POST", base.appendingPathComponent(route), body)
+    }
+
     private static func isSegment(_ value: String) -> Bool {
         !value.isEmpty && value.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) || "_-".unicodeScalars.contains($0) }
     }

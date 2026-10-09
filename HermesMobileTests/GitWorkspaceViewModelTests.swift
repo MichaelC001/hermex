@@ -433,7 +433,7 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
 
     /// Changes rows come from `review/list` (counts, status letter, staged) joined by path with
     /// `status.files`' flags, which the host lists in its own order. The badge reads the branch,
-    /// ahead/behind and dirty count from the status, and a Hermes chat has no writes.
+    /// ahead/behind and dirty count from the status, and a Hermes chat has writes but no branches.
     @MainActor
     func testHermesChangesJoinReviewRowsWithStatusFlagsByPath() async throws {
         let git = HermesGitHost.client { request in
@@ -455,7 +455,8 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
         await changes.load()
 
         XCTAssertTrue(availability.hasRepository)
-        XCTAssertFalse(availability.supportsWrites)
+        XCTAssertTrue(availability.supportsWrites)
+        XCTAssertFalse(availability.supportsBranches)
         XCTAssertEqual(availability.currentBranchName, "feature/x")
         XCTAssertEqual(availability.gitInfo?.ahead, 2)
         XCTAssertEqual(availability.gitInfo?.behind, 1)
@@ -1222,4 +1223,571 @@ final class GitWorkspaceViewModelTests: APIClientTestCase {
 
         XCTAssertEqual(calls, ["/api/git/discard"], "No staged targets means no unstage call.")
     }
+}
+
+// MARK: - Hermes writes (#1115)
+
+extension GitWorkspaceViewModelTests {
+    /// Push names the repository root. The host would skip a detached HEAD without a word, so
+    /// one is refused with webui's copy and never sent; the status is read again either way.
+    @MainActor
+    func testAHermesPushSendsTheRootAndRefusesADetachedHead() async throws {
+        nonisolated(unsafe) var detached = false
+        let git = HermesGitHost.client { request in
+            HermesGitHost.repositoryReply(request, detached: detached, ahead: 1, rows: [("a.swift", 1, 0, "M", false)],
+                                          flags: [("a.swift", false, true, false, false)])
+        }
+        let availability = GitWorkspaceAvailabilityViewModel(
+            session: SessionSummary(), server: URL(string: "https://webui.example")!, git: git
+        )
+        await availability.load()
+
+        let pushed = await availability.performRemoteAction(.push)
+        HermesHostFixture.script { detached = true }
+        let statusReads = HermesGitHost.requests.filter { $0.url?.path == "/api/git/status" }.count
+        let refused = await availability.performRemoteAction(.push)
+
+        XCTAssertTrue(availability.supportsWrites)
+        XCTAssertTrue(pushed)
+        XCTAssertFalse(refused)
+        XCTAssertEqual(availability.actionErrorMessage, String(localized: "Cannot push from a detached HEAD"))
+        let pushes = HermesGitHost.requests.filter { $0.url?.path == "/api/git/review/push" }
+        XCTAssertEqual(pushes.map(HermesCronFixture.body), [.object(["path": .string(HermesGitHost.repository)])])
+        XCTAssertGreaterThan(HermesGitHost.requests.filter { $0.url?.path == "/api/git/status" }.count, statusReads + 1,
+                             "The refusal reads the head, then the status again")
+    }
+
+    /// A Hermes repository's commit sheet on the host `script` answers, its messages written by
+    /// `writeMessage`.
+    @MainActor
+    private func hermesCommitSheet(
+        writeMessage: HermesGitClient.MessageWriter? = nil,
+        _ script: @escaping (URLRequest) -> HermesHostFixture.Reply?
+    ) async -> GitCommitViewModel {
+        let sheet = GitCommitViewModel(git: HermesGitHost.client(writeMessage: writeMessage, script))
+        await sheet.load()
+        return sheet
+    }
+
+    /// One edited, one staged and one untracked file, as the host lists them.
+    private static func threeChanges(_ request: URLRequest, conflicted: Bool = false) -> HermesHostFixture.Reply? {
+        HermesGitHost.repositoryReply(request, rows: [
+            ("a.swift", 1, 0, "M", false), ("b.swift", 2, 1, "M", true), ("c.txt", 1, 0, conflicted ? "U" : "?", false)
+        ], flags: [
+            ("a.swift", false, true, false, false), ("b.swift", true, false, false, false),
+            ("c.txt", false, !conflicted, !conflicted, conflicted)
+        ])
+    }
+
+    /// Stage, unstage and discard act on the selection, or everything, one file per request,
+    /// and the list is read at each write, for the rows it acts on, and again after it.
+    @MainActor
+    func testTheHermesSheetStagesUnstagesAndDiscardsTheSelectionAndRefreshes() async throws {
+        let sheet = await hermesCommitSheet { Self.threeChanges($0) }
+        let files = sheet.trackedFiles
+
+        sheet.toggleSelection(files[0])
+        await sheet.stageSelectedOrAll()
+        let listReads = HermesGitHost.requests.filter { $0.url?.path == "/api/git/review/list" }.count
+        sheet.clearSelection()
+        await sheet.unstageSelectedOrAll()
+        sheet.toggleSelection(files[2])
+        await sheet.discardSelectedOrAll(deleteUntracked: true)
+
+        XCTAssertNil(sheet.actionErrorMessage)
+        XCTAssertEqual(HermesGitHost.writes, ["stage a.swift", "unstage b.swift", "revert c.txt"])
+        XCTAssertEqual(listReads, 3, "The load, then the reads at staging and after it")
+        XCTAssertEqual(HermesGitHost.requests.filter { $0.url?.path == "/api/git/review/list" }.count, 7)
+        XCTAssertFalse(sheet.hasSelection, "A discarded file leaves the selection")
+    }
+
+    /// Staging a conflicted file would mark it resolved, and webui refuses to discard or commit
+    /// one, so none of them is sent.
+    @MainActor
+    func testAHermesConflictRefusesStageDiscardAndCommit() async throws {
+        let sheet = await hermesCommitSheet { Self.threeChanges($0, conflicted: true) }
+        var refusals: [String?] = []
+
+        await sheet.stageSelectedOrAll()
+        refusals.append(sheet.actionErrorMessage)
+        await sheet.discardSelectedOrAll(deleteUntracked: true)
+        refusals.append(sheet.actionErrorMessage)
+        sheet.message = "fix: keep it"
+        let committed = await sheet.commit(push: false)
+        refusals.append(sheet.actionErrorMessage)
+
+        XCTAssertFalse(committed)
+        XCTAssertEqual(refusals, [String(localized: "Conflicted files cannot be staged from this panel"),
+                                  String(localized: "Conflicted files cannot be discarded from this panel"),
+                                  String(localized: "Resolve conflicts before committing")])
+        XCTAssertEqual(HermesGitHost.writes, [])
+    }
+
+    /// The host stages everything for a commit with nothing staged, so one is refused; with
+    /// something staged it commits, never pushing in the same call, and shows HEAD's short sha.
+    @MainActor
+    func testAHermesCommitNeedsSomethingStagedAndShowsItsSha() async throws {
+        nonisolated(unsafe) var staged = false
+        let sheet = await hermesCommitSheet { request in
+            HermesGitHost.repositoryReply(request, rows: [("a.swift", 1, 0, "M", staged)],
+                                          flags: [("a.swift", staged, !staged, false, false)])
+        }
+        sheet.message = "fix(app): keep the row"
+
+        let refused = await sheet.commit(push: false)
+        let refusal = sheet.actionErrorMessage
+        HermesHostFixture.script { staged = true }
+        let committed = await sheet.commit(push: false)
+
+        XCTAssertFalse(refused)
+        XCTAssertEqual(refusal, String(localized: "Stage changes before committing"))
+        XCTAssertTrue(committed)
+        XCTAssertEqual(sheet.lastCommitSHA, "abc1234")
+        XCTAssertEqual(sheet.shownCommitSHA, "abc1234")
+        XCTAssertEqual(HermesGitHost.writes, [#"commit "fix(app): keep the row""#])
+    }
+
+    /// The host commits the whole index, so Commit Selected unstages everything, stages the
+    /// selection, checks something is staged, commits, then stages the other staged files again.
+    @MainActor
+    func testAHermesCommitSelectedKeepsTheOtherStagedFilesStaged() async throws {
+        let sheet = await hermesCommitSheet { Self.threeChanges($0) }
+        sheet.toggleSelection(sheet.trackedFiles[0])
+        sheet.message = "feat(app): add a"
+
+        let committed = await sheet.commitSelected(push: false)
+
+        XCTAssertTrue(committed)
+        XCTAssertEqual(HermesGitHost.writes, ["unstage (all)", "stage a.swift", #"commit "feat(app): add a""#, "stage b.swift"])
+        XCTAssertEqual(sheet.lastCommitSHA, "abc1234")
+        XCTAssertFalse(sheet.hasSelection)
+    }
+
+    /// A commit that fails partway puts the staged files back as they were, says so without
+    /// git's output, and reads the status again.
+    @MainActor
+    func testAHermesCommitSelectedRestoresTheStagedFilesWhenTheCommitFails() async throws {
+        let sheet = await hermesCommitSheet { request in
+            request.url?.path == "/api/git/review/commit"
+                ? .json(400, .object(["detail": .string("hook failed")])) : Self.threeChanges(request)
+        }
+        sheet.toggleSelection(sheet.trackedFiles[0])
+        sheet.message = "feat(app): add a"
+        let statusReads = HermesGitHost.requests.filter { $0.url?.path == "/api/git/review/list" }.count
+
+        let committed = await sheet.commitSelected(push: false)
+
+        XCTAssertFalse(committed)
+        XCTAssertEqual(HermesGitHost.writes, ["unstage (all)", "stage a.swift", #"commit "feat(app): add a""#,
+                                              "unstage (all)", "stage b.swift"])
+        XCTAssertEqual(sheet.actionErrorMessage, String(localized: "Git couldn’t finish this change on your Hermes host."))
+        XCTAssertEqual(sheet.message, "feat(app): add a", "The message stays for a retry")
+        XCTAssertEqual(HermesGitHost.requests.filter { $0.url?.path == "/api/git/review/list" }.count, statusReads + 2,
+                       "The remembered staged files, then the status after the failure")
+    }
+
+    /// Suggest sends `commit-context`'s diff and recent subjects, or the selected files' whole
+    /// changes; Regenerate also sends the last suggestion to avoid.
+    @MainActor
+    func testAHermesSuggestionSendsWhatWouldCommitAndAvoidsTheLastOne() async throws {
+        nonisolated(unsafe) var asked: [(diff: String, recent: String, avoid: String?)] = []
+        let sheet = await hermesCommitSheet(writeMessage: { diff, recent, avoid in
+            asked.append((diff, recent, avoid))
+            return "  feat(app): message \(asked.count)\n"
+        }) { Self.threeChanges($0) }
+
+        await sheet.suggestMessage()
+        let first = sheet.message
+        await sheet.suggestMessage()
+        sheet.toggleSelection(sheet.trackedFiles[0])
+        sheet.toggleSelection(sheet.trackedFiles[2])
+        await sheet.suggestMessage()
+
+        XCTAssertEqual(first, "feat(app): message 1")
+        XCTAssertEqual(sheet.message, "feat(app): message 3")
+        XCTAssertEqual(asked.map(\.diff), [HermesGitHost.contextDiff, HermesGitHost.contextDiff,
+                                           HermesGitHost.diffText(for: "a.swift") + HermesGitHost.diffText(for: "c.txt")])
+        XCTAssertEqual(asked.map(\.recent), Array(repeating: HermesGitHost.recentSubjects, count: 3))
+        XCTAssertEqual(asked.map(\.avoid), [nil, "feat(app): message 1", "feat(app): message 2"])
+        XCTAssertFalse(sheet.messageWasTruncated)
+    }
+
+    /// One tap on a Hermes repository stages every change a file at a time, writes a message for
+    /// it, commits and reports the sha.
+    @MainActor
+    func testAHermesQuickCommitStagesEachFileThenCommits() async throws {
+        let git = HermesGitHost.client(writeMessage: { _, _, _ in "chore: tidy" }) { Self.threeChanges($0) }
+        let availability = GitWorkspaceAvailabilityViewModel(
+            session: SessionSummary(), server: URL(string: "https://webui.example")!, git: git
+        )
+        await availability.load()
+
+        let outcome = await availability.quickCommit(push: false)
+
+        guard case .success(let result) = outcome else { return XCTFail("Expected success, got \(outcome)") }
+        XCTAssertEqual(result.shortSHA, "abc1234")
+        XCTAssertEqual(result.message, "chore: tidy")
+        XCTAssertEqual(HermesGitHost.writes, ["stage a.swift", "stage c.txt", #"commit "chore: tidy""#])
+    }
+
+    // MARK: Review fixes
+
+    /// One edited file and one staged file that `stagedAlso` describes: also edited in the
+    /// worktree (`true`), or past the status cap, where that is unknown (`nil`).
+    private static func partlyStaged(_ request: URLRequest, stagedAlso unstaged: Bool?) -> HermesHostFixture.Reply? {
+        HermesGitHost.repositoryReply(request, rows: [("a.swift", 1, 0, "M", false), ("b.swift", 2, 1, "M", true)],
+                                      flags: [("a.swift", false, true, false, false)]
+                                          + (unstaged.map { [("b.swift", true, $0, false, false)] } ?? []))
+    }
+
+    /// `git add` can put back only a whole file, so Commit Selected is refused before it changes
+    /// the index while a staged file outside the selection also has worktree edits, or may have
+    /// (past the status cap): restoring it would stage those too.
+    @MainActor
+    func testAHermesCommitSelectedRefusesAPartlyStagedFileBeforeAnythingIsSent() async throws {
+        for unstaged in [true, nil] as [Bool?] {
+            HermesHostFixture.reset()
+            let sheet = await hermesCommitSheet { Self.partlyStaged($0, stagedAlso: unstaged) }
+            sheet.toggleSelection(sheet.trackedFiles[0])
+            sheet.message = "feat(app): add a"
+
+            let committed = await sheet.commitSelected(push: false)
+
+            XCTAssertFalse(committed)
+            XCTAssertEqual(sheet.actionErrorMessage, String(localized:
+                "Fully stage or fully unstage partly staged or renamed files before committing selected files"), "\(String(describing: unstaged))")
+            XCTAssertEqual(HermesGitHost.writes, [], "\(String(describing: unstaged))")
+        }
+    }
+
+    /// Before the first commit the host can't unstage everything, so Commit Selected is refused
+    /// up front, and the index stays as it was.
+    @MainActor
+    func testAHermesCommitSelectedBeforeTheFirstCommitIsRefusedUpFront() async throws {
+        let sheet = await hermesCommitSheet { request in
+            HermesGitHost.repositoryReply(request, unborn: true, rows: [("a.swift", 1, 0, "A", true), ("b.swift", 1, 0, "A", true)],
+                                          flags: [("a.swift", true, false, false, false), ("b.swift", true, false, false, false)])
+        }
+        sheet.toggleSelection(sheet.trackedFiles[0])
+        sheet.message = "feat(app): start"
+
+        let committed = await sheet.commitSelected(push: false)
+
+        XCTAssertFalse(committed)
+        XCTAssertEqual(sheet.actionErrorMessage, String(localized: "Make the first commit with Commit, then commit selected files"))
+        XCTAssertEqual(HermesGitHost.writes, [])
+    }
+
+    /// The three changes' reply, except a 400 for `route`, or only for its requests naming `file`.
+    private static func failing(_ request: URLRequest, route: String, file: String? = nil) -> HermesHostFixture.Reply? {
+        let body = apiTestBodyData(from: request).flatMap { try? JSONDecoder().decode(BotJSON.self, from: $0) }
+        let fails = request.url?.path == route && (file == nil || body?["file"].text == ":(literal)" + (file ?? ""))
+        return fails ? .json(400, .object(["detail": .string("index.lock exists")])) : threeChanges(request)
+    }
+
+    /// A Commit Selected whose commit lands but which can't stage the other staged files again
+    /// keeps the commit and its sha, and says the staging wasn't put back.
+    @MainActor
+    func testAHermesCommitSelectedSaysWhenItCouldNotStageTheOtherFilesAgain() async throws {
+        let sheet = await hermesCommitSheet { request in
+            Self.failing(request, route: "/api/git/review/stage", file: "b.swift")
+        }
+        sheet.toggleSelection(sheet.trackedFiles[0])
+        sheet.message = "feat(app): add a"
+
+        let committed = await sheet.commitSelected(push: false)
+
+        XCTAssertTrue(committed)
+        XCTAssertEqual(sheet.lastCommitSHA, "abc1234")
+        XCTAssertEqual(sheet.actionErrorMessage, String(localized: "Committed, but some files couldn’t be staged again."))
+        XCTAssertEqual(HermesGitHost.writes, ["unstage (all)", "stage a.swift", #"commit "feat(app): add a""#, "stage b.swift"])
+    }
+
+    /// A Commit Selected that fails before its commit, and then can't stage the files again
+    /// either, says both, not only that the commit failed.
+    @MainActor
+    func testAHermesCommitSelectedSaysWhenItCouldNotPutTheStagedFilesBack() async throws {
+        let sheet = await hermesCommitSheet { request in
+            request.url?.path == "/api/git/review/commit"
+                ? .json(400, .object(["detail": .string("hook failed")]))
+                : Self.failing(request, route: "/api/git/review/stage", file: "b.swift")
+        }
+        sheet.toggleSelection(sheet.trackedFiles[0])
+        sheet.message = "feat(app): add a"
+
+        let committed = await sheet.commitSelected(push: false)
+
+        XCTAssertFalse(committed)
+        XCTAssertEqual(sheet.actionErrorMessage,
+                       String(localized: "Git couldn’t finish this change, and the staged files couldn’t be restored."))
+        XCTAssertEqual(HermesGitHost.writes, ["unstage (all)", "stage a.swift", #"commit "feat(app): add a""#,
+                                              "unstage (all)", "stage b.swift"])
+    }
+
+    /// A quick commit whose turn starts while its message is being written stops before the
+    /// commit: the chat's turn owns the repository now.
+    @MainActor
+    func testAHermesQuickCommitStopsWhenATurnStartsDuringItsMessage() async throws {
+        let chat = HermesGitChatStub()
+        let git = HermesGitHost.client(writeMessage: { _, _, _ in
+            chat.turnRunning = true
+            return "chore: tidy"
+        }, writeOwner: chat.owner) { Self.threeChanges($0) }
+        let availability = GitWorkspaceAvailabilityViewModel(
+            session: SessionSummary(), server: URL(string: "https://webui.example")!, git: git
+        )
+        await availability.load()
+
+        let outcome = await availability.quickCommit(push: true)
+
+        XCTAssertEqual(outcome, .failure)
+        XCTAssertEqual(availability.actionErrorMessage,
+                       String(localized: "Wait for the active response to finish before changing this repository."))
+        XCTAssertEqual(HermesGitHost.writes, ["stage a.swift", "stage c.txt"])
+    }
+
+    // MARK: Review fixes, round 2
+
+    /// Commit Selected clears the whole index and promises to put back every staged file, so each
+    /// one it remembers must name one file. The host trims a tracked file's name, so ` a.txt` and
+    /// `a.txt` both list as `a.txt`: staging that path again couldn't reach both, and the
+    /// sequence is refused before it changes anything.
+    @MainActor
+    func testAHermesCommitSelectedRefusesStagedFilesItCouldNotPutBack() async throws {
+        let sheet = await hermesCommitSheet { request in
+            HermesGitHost.repositoryReply(request, rows: [
+                ("a.txt", 1, 0, "M", true), ("a.txt", 1, 0, "M", true), ("c.txt", 1, 0, "M", false)
+            ], flags: [("a.txt", true, false, false, false), ("c.txt", false, true, false, false)])
+        }
+        sheet.toggleSelection(try XCTUnwrap(sheet.trackedFiles.first { $0.path == "c.txt" }))
+        sheet.message = "feat(app): add c"
+
+        let committed = await sheet.commitSelected(push: false)
+
+        XCTAssertFalse(committed)
+        XCTAssertEqual(sheet.actionErrorMessage, String(localized: "Git couldn’t finish this change on your Hermes host."))
+        XCTAssertEqual(HermesGitHost.writes, [])
+    }
+
+    /// A Commit Selected whose first reset reaches the host but whose reply is lost may have
+    /// cleared the index: it puts the staged files back before it reports the failure.
+    @MainActor
+    func testAHermesCommitSelectedPutsTheStagedFilesBackWhenTheResetsReplyIsLost() async throws {
+        nonisolated(unsafe) var bStaged = true
+        nonisolated(unsafe) var resets = 0
+        let sheet = await hermesCommitSheet { request in
+            let body = HermesCronFixture.body(request)
+            switch (request.url?.path, body["file"].text) {
+            case ("/api/git/review/unstage", nil):
+                resets += 1
+                bStaged = false
+                return resets == 1 ? .fail(URLError(.networkConnectionLost)) : .json(200, .object(["ok": .bool(true)]))
+            case ("/api/git/review/stage", ":(literal)b.swift"):
+                bStaged = true
+                return .json(200, .object(["ok": .bool(true)]))
+            default:
+                return HermesGitHost.repositoryReply(request, rows: [("a.swift", 1, 0, "M", false), ("b.swift", 2, 1, "M", bStaged)],
+                                                     flags: [("a.swift", false, true, false, false), ("b.swift", bStaged, !bStaged, false, false)])
+            }
+        }
+        sheet.toggleSelection(sheet.trackedFiles[0])
+        sheet.message = "feat(app): add a"
+
+        let committed = await sheet.commitSelected(push: false)
+
+        XCTAssertFalse(committed)
+        XCTAssertEqual(HermesGitHost.writes, ["unstage (all)", "unstage (all)", "stage b.swift"])
+        XCTAssertTrue(bStaged, "The staged file is staged again")
+        XCTAssertNotEqual(sheet.actionErrorMessage,
+                          String(localized: "Git couldn’t finish this change, and the staged files couldn’t be restored."))
+        XCTAssertNotNil(sheet.actionErrorMessage)
+    }
+
+    /// A quick commit still running when the chat leaves the folder (`retire()`) finishes without
+    /// a result to show: no later phase, no push, and nothing for the toast.
+    @MainActor
+    func testAHermesQuickCommitFinishingAfterAFolderChangeShowsNothing() async throws {
+        let git = HermesGitHost.client(writeMessage: { _, _, _ in "chore: tidy" }) { request in
+            request.url?.path == "/api/git/review/commit" ? .park : Self.threeChanges(request)
+        }
+        let availability = GitWorkspaceAvailabilityViewModel(
+            session: SessionSummary(), server: URL(string: "https://webui.example")!, git: git
+        )
+        await availability.load()
+        HermesHostFixture.onPark = { Task { @MainActor in
+            availability.retire()
+            HermesHostFixture.releaseParked()
+        } }
+        var phases: [GitCommitPhase] = []
+
+        let outcome = await availability.quickCommit(push: true) { phases.append($0) }
+
+        XCTAssertEqual(outcome, .retired)
+        XCTAssertEqual(phases, [.generatingMessage, .committing])
+        XCTAssertNil(availability.actionErrorMessage)
+        XCTAssertEqual(HermesGitHost.writes, ["stage a.swift", "stage c.txt", #"commit "chore: tidy""#])
+    }
+
+    /// A push still running when the chat leaves the folder finishes without a result to show.
+    @MainActor
+    func testAHermesPushFinishingAfterAFolderChangeShowsNothing() async throws {
+        let git = HermesGitHost.client { request in
+            request.url?.path == "/api/git/review/push" ? .park : Self.threeChanges(request)
+        }
+        let availability = GitWorkspaceAvailabilityViewModel(
+            session: SessionSummary(), server: URL(string: "https://webui.example")!, git: git
+        )
+        await availability.load()
+        HermesHostFixture.onPark = { Task { @MainActor in
+            availability.retire()
+            HermesHostFixture.releaseParked(.json(400, .object(["detail": .string("rejected")])))
+        } }
+
+        let pushed = await availability.performRemoteAction(.push)
+
+        XCTAssertFalse(pushed)
+        XCTAssertTrue(availability.isRetired)
+        XCTAssertNil(availability.actionErrorMessage)
+        XCTAssertNil(availability.lastActionMessage)
+    }
+
+    /// While a quick commit waits for its message, the commit sheet on the same repository is busy
+    /// and sends nothing, so the quick commit commits what it staged.
+    @MainActor
+    func testTheHermesSheetWritesNothingWhileAQuickCommitWaitsForItsMessage() async throws {
+        let reference = SheetReference()
+        nonisolated(unsafe) var duringMessage: (busy: Bool, committed: Bool, writes: [String])?
+        let git = HermesGitHost.client(writeMessage: { _, _, _ in
+            if let sheet = reference.sheet {
+                sheet.toggleSelection(sheet.trackedFiles[1])
+                sheet.message = "feat(app): only b"
+                await sheet.unstageSelectedOrAll()
+                await sheet.discardSelectedOrAll(deleteUntracked: true)
+                let committed = await sheet.commitSelected(push: false)
+                duringMessage = (sheet.isBusy, committed, HermesGitHost.writes)
+            }
+            return "chore: tidy"
+        }) { Self.threeChanges($0) }
+        let availability = GitWorkspaceAvailabilityViewModel(
+            session: SessionSummary(), server: URL(string: "https://webui.example")!, git: git
+        )
+        await availability.load()
+        let commitSheet = GitCommitViewModel(git: git)
+        await commitSheet.load()
+        reference.sheet = commitSheet
+
+        let outcome = await availability.quickCommit(push: false)
+
+        XCTAssertEqual(duringMessage?.busy, true)
+        XCTAssertEqual(duringMessage?.committed, false)
+        XCTAssertEqual(duringMessage?.writes, ["stage a.swift", "stage c.txt"])
+        guard case .success = outcome else { return XCTFail("Expected success, got \(outcome)") }
+        XCTAssertEqual(HermesGitHost.writes, ["stage a.swift", "stage c.txt", #"commit "chore: tidy""#])
+        XCTAssertFalse(commitSheet.isBusy)
+    }
+
+    /// While the commit sheet commits, the Git menu's quick commit and push are disabled and send
+    /// nothing.
+    @MainActor
+    func testAHermesQuickCommitAndPushWaitForTheSheetsCommit() async throws {
+        let git = HermesGitHost.client(writeMessage: { _, _, _ in "chore: tidy" }) { request in
+            request.url?.path == "/api/git/review/commit" ? .park : Self.threeChanges(request)
+        }
+        let availability = GitWorkspaceAvailabilityViewModel(
+            session: SessionSummary(), server: URL(string: "https://webui.example")!, git: git
+        )
+        await availability.load()
+        let sheet = GitCommitViewModel(git: git)
+        await sheet.load()
+        sheet.message = "feat(app): b"
+        nonisolated(unsafe) var duringCommit: (running: Bool, outcome: GitQuickCommitOutcome, pushed: Bool)?
+        HermesHostFixture.onPark = { Task { @MainActor in
+            let running = availability.isRunningGitAction
+            let outcome = await availability.quickCommit(push: true)
+            let pushed = await availability.performRemoteAction(.push)
+            duringCommit = (running, outcome, pushed)
+            HermesHostFixture.releaseParked()
+        } }
+
+        let committed = await sheet.commit(push: false)
+
+        XCTAssertTrue(committed)
+        XCTAssertEqual(duringCommit?.running, true)
+        XCTAssertEqual(duringCommit?.outcome, .failure)
+        XCTAssertEqual(duringCommit?.pushed, false)
+        XCTAssertEqual(HermesGitHost.writes, [#"commit "feat(app): b""#])
+        XCTAssertFalse(availability.isRunningGitAction)
+    }
+
+    /// Before the first commit `file-diff` is empty, so a selected new file's message is written
+    /// from its current content, as its diff shows it.
+    @MainActor
+    func testAHermesSuggestionBeforeTheFirstCommitSendsANewFilesContent() async throws {
+        nonisolated(unsafe) var asked: [String] = []
+        let sheet = await hermesCommitSheet(writeMessage: { diff, _, _ in
+            asked.append(diff)
+            return "feat(app): add notes"
+        }) { request in
+            switch request.url?.path {
+            case "/api/git/file-diff":
+                return .json(200, .object(["diff": .string("")]))
+            case "/api/fs/read-text":
+                return .json(200, .object(["binary": .bool(false), "byteSize": .number(13), "truncated": .bool(false),
+                                           "text": .string("first\nsecond\n")]))
+            default:
+                return HermesGitHost.repositoryReply(request, unborn: true, rows: [("notes.txt", 2, 0, "A", true)],
+                                                     flags: [("notes.txt", true, false, false, false)])
+            }
+        }
+        sheet.toggleSelection(sheet.trackedFiles[0])
+
+        await sheet.suggestMessage()
+
+        XCTAssertNil(sheet.actionErrorMessage)
+        XCTAssertEqual(sheet.message, "feat(app): add notes")
+        XCTAssertEqual(asked, ["diff --git a/notes.txt b/notes.txt\n--- /dev/null\n+++ b/notes.txt\n@@ -0,0 +1,2 @@\n+first\n+second\n"])
+        XCTAssertEqual(HermesHostFixture.requests.last.map(HermesGitHost.describe),
+                       "/api/fs/read-text path=\(HermesGitHost.repository)/notes.txt")
+    }
+
+    /// webui's writes keep their presentation (#1115): a failed one doesn't read the status
+    /// again, and the sheet shows no commit sha.
+    @MainActor
+    func testAWebUICommitSheetKeepsItsPresentation() async throws {
+        nonisolated(unsafe) var statusReads = 0
+        let client = makeClient { request in
+            switch request.url?.path {
+            case "/api/git/status":
+                statusReads += 1
+                return apiTestJSONResponse(Self.statusWithOneFile, for: request)
+            case "/api/git/stage":
+                let response = HTTPURLResponse(url: request.url!, statusCode: 403, httpVersion: nil,
+                                               headerFields: ["Content-Type": "application/json"])!
+                return (response, Data(#"{"error":"Destructive git writes are disabled","code":"destructive_git_disabled"}"#.utf8))
+            case "/api/git/commit":
+                return apiTestJSONResponse(#"{"ok":true,"commit":"abc1234","status":{"is_git":true,"branch":"main","files":[]}}"#, for: request)
+            default:
+                return apiTestJSONResponse("{}", for: request)
+            }
+        }
+        let sheet = GitCommitViewModel(session: try session(id: "s1"), server: URL(string: "https://example.test")!, apiClient: client)
+        await sheet.load()
+
+        await sheet.stageSelectedOrAll()
+        let failure = sheet.actionErrorMessage
+        let readsAfterTheFailure = statusReads
+        sheet.message = "fix: a"
+        let committed = await sheet.commit(push: false)
+
+        XCTAssertEqual(failure?.contains("Writes disabled"), true)
+        XCTAssertEqual(readsAfterTheFailure, 1, "Only the load")
+        XCTAssertTrue(committed)
+        XCTAssertEqual(sheet.lastCommitSHA, "abc1234")
+        XCTAssertNil(sheet.shownCommitSHA)
+    }
+}
+
+/// The commit sheet a test's message writer reaches, set once both exist.
+@MainActor private final class SheetReference {
+    var sheet: GitCommitViewModel?
 }
