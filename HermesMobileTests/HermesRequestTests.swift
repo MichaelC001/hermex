@@ -276,6 +276,27 @@ final class HermesRequestTests: XCTestCase {
         }
     }
 
+    /// The host rewrites a branch name before `git switch` (`_sanitize_branch`), so a name it
+    /// would change, which could reach another branch, is refused before anything is sent (#1116).
+    func testABranchSwitchSendsOnlyANameTheHostKeeps() throws {
+        let base = URL(string: "https://hermes.example")!
+        // A decomposed accent (U+0301) or zero-width joiner is stripped by the host, so "cafe\u{301}"
+        // would switch to "cafe"; the precomposed "café" and other letters and numerals pass.
+        for name in ["", "feat+x", "my branch", "-x", "x/", ".x", "a..b", "a//b", "a--b", "a@{1}", "x~1",
+                     "cafe\u{301}", "a\u{200D}b", "x\u{903}"] {
+            XCTAssertThrowsError(try HermesREST.gitSwitchBranch(repository: "/r", branch: name).request(base: base), name)
+        }
+        XCTAssertThrowsError(try HermesREST.gitSwitchBranch(repository: "", branch: "dev").request(base: base))
+        for name in ["dev", "feature/x-1", "release_2.0", "caf\u{E9}", "x\u{663}", "\u{216B}", "\u{2B0}x"] {
+            let request = try HermesREST.gitSwitchBranch(repository: "/r", branch: name).request(base: base)
+            let body = try JSONDecoder().decode(BotJSON.self, from: XCTUnwrap(request.httpBody))
+            // String equality is canonical, so compare scalars: the name goes out unnormalized.
+            guard case .object(let fields) = body, case .string(let sent) = fields["branch"] else { return XCTFail(name) }
+            XCTAssertEqual(fields["path"], .string("/r"))
+            XCTAssertEqual(Array(sent.unicodeScalars), Array(name.unicodeScalars), name)
+        }
+    }
+
     func testEveryRESTRequestKeepsItsMethodPathQueryAndBody() throws {
         let base = URL(string: "https://hermes.example:9120")!
         let json = ["Content-Type": "application/json"]
@@ -359,6 +380,9 @@ final class HermesRequestTests: XCTestCase {
             (.gitHead(repository: "/r/a+b"), "GET", "https://hermes.example:9120/api/git/review/rev-parse?path=/r/a%2Bb", nil, [:]),
             (.gitCommitContext(repository: "/r"), "GET", "https://hermes.example:9120/api/git/review/commit-context?path=/r",
              nil, [:]),
+            (.gitBranches(repository: "/r/a+b"), "GET", "https://hermes.example:9120/api/git/branches?path=/r/a%2Bb", nil, [:]),
+            (.gitSwitchBranch(repository: "/r", branch: "feature/x"), "POST", "https://hermes.example:9120/api/git/branch/switch",
+             .object(["path": .string("/r"), "branch": .string("feature/x")]), json),
             (.config(profile: "research"), "GET", "https://hermes.example:9120/api/config?profile=research", nil, [:]),
             (.profileSoul(name: "research"), "GET", "https://hermes.example:9120/api/profiles/research/soul", nil, [:]),
             (.setProfileSoul(name: "research", content: "Be direct."), "PUT", "https://hermes.example:9120/api/profiles/research/soul",

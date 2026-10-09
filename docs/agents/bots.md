@@ -1517,8 +1517,8 @@ panel (#1113) and Git (#1114) read the same context.
   leaves the path unmapped. A diff over 512 KiB shows webui's too-large notice, and a
   `Binary files … differ` patch the binary one. A failed git call is 400 `{detail}`, git's
   stderr: it reads as "Repository status unavailable", and neither it nor the root is shown or
-  logged. Fetch, Pull and the branch picker are webui-only and hidden; with the picker gone, the
-  menu shows the branch and `↑ahead ↓behind` as a row above Changes. The turn-end refresh and the
+  logged. Fetch and Pull are webui-only and hidden; the menu shows the branch and
+  `↑ahead ↓behind` as a row above Changes instead. The turn-end refresh and the
   Changes card work as on webui. A `cwd` or backend change closes an open Git sheet and reads the
   new folder's repository.
 - **Git writes (#1115).** Stage Changes, Commit, Commit & Push, Push and the inline commit button
@@ -1557,6 +1557,17 @@ panel (#1113) and Git (#1114) read the same context.
   `avoid` on Regenerate. Every write reads the status again, and so does a failed one (webui's
   failed writes don't, and only a Hermes sheet shows the commit's sha: `GitDataClient.isHermes`).
   A refusal reads as "Git couldn’t finish this change on your Hermes host.", never git's stderr.
+- **Branches (#1116).** The composer's branch picker lists `GET git/branches?path=<root>` (local
+  heads, then remote-tracking refs with no local head) and switches with `POST git/branch/switch
+  {path, branch}`, which runs `git switch`. A remote row goes out by its short name (`origin/x` →
+  `x`), which git turns into a tracking branch. The host rejects `origin/x`, so the remote can't
+  be named: the switch reads the list again and is refused unless that row is the only branch
+  called `x` (another remote's `x` leaves git to refuse or follow `checkout.defaultRemote`). The
+  host rewrites names first, so one it would change (`HermesREST.isBranchName`) is refused. A switch is a write the chat owns, as above, holds
+  the repository's `GitWriteLock` (the picker is disabled while another write holds it), and any
+  uncommitted change, untracked files included, refuses it with "Commit or discard first.":
+  there is no stash, and `git switch` would carry the changes across. New Branch, Fetch and Pull
+  stay hidden. After a switch the status and branches are read again.
 
 ## Memory on a Hermes host
 
