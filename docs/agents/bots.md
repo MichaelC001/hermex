@@ -1498,6 +1498,29 @@ panel (#1113) and Git (#1114) read the same context.
   webui switch does not reload it: that switch is optimistic). A `complete.path` with no
   reply fails only that lookup, never the chat's connection; Bot Chat's still ends its
   connection, as before.
+- **Git, read-only (#1114).** The Git menu, Changes sheet, diffs and turn-changes card read
+  through `HermesGitClient`, the `GitDataClient` beside webui's `WebUIGitClient`, mapped into
+  webui's Git models. Same `local` gate as Files; a folder outside a repository hides Git. It
+  shows the whole repository holding the `cwd`: `GET /api/fs/git-root?path=<cwd>` resolves the
+  root once per folder, and `git/status`, `git/review/list?scope=uncommitted` and
+  `git/review/diff` all take `path=<root>`, since their paths are root-relative. Rows are
+  `review/list`'s (uncapped, sorted) joined by path with `status.files`' flags, which the host
+  caps at 200; a row past the cap has no `unstaged` flag and takes untracked and conflicted from
+  its status letter, so the list is never marked truncated. A staged row past the cap may also
+  have worktree edits, so its diff is `git/file-diff` (the whole change against HEAD) instead of
+  the staged half. Before the first commit there is no HEAD and `file-diff` answers `""`, so a
+  new (`A`) file there shows its current content from `fs/read-text` as all additions. Tool paths
+  are relative to the `cwd` or absolute; the turn-changes card anchors them to the `cwd`,
+  collapses `.` and `..`, and maps them to root-relative row paths before joining. `git-root`
+  resolves symlinks (`/private/tmp/app`) while the `cwd` keeps its spelling (`/tmp/app`), so the
+  `cwd` is matched to the root by the root's trailing folders; a symlink that renames a folder
+  leaves the path unmapped. A diff over 512 KiB shows webui's too-large notice, and a
+  `Binary files … differ` patch the binary one. A failed git call is 400 `{detail}`, git's
+  stderr: it reads as "Repository status unavailable", and neither it nor the root is shown or
+  logged. Every write (Stage Changes, Commit, Push, Fetch, Pull, the branch picker, the inline
+  commit button) is hidden; with the picker gone, the menu shows the branch and `↑ahead ↓behind`
+  as a row above Changes. The turn-end refresh and the Changes card work as on webui. A `cwd` or
+  backend change closes an open Git sheet and reads the new folder's repository.
 
 ## Memory on a Hermes host
 
