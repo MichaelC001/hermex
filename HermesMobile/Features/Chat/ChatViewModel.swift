@@ -1615,16 +1615,45 @@ final class ChatViewModel {
     /// The thumbnail cache namespace of a Hermes session; nil on a webui chat.
     var hermesAttachmentCacheNamespace: String? { hermesTurn?.attachmentCacheNamespace }
 
+    /// A Hermes session's working folder (#1112); nil on a webui chat, and until `session.info`
+    /// names it.
+    var hermesWorkspace: HermesWorkspaceContext? { hermesTurn?.workspace }
+
+    /// The files of `hermesWorkspace`, on the session's connection.
+    var hermesWorkspaceFiles: HermesWorkspaceFileClient? { hermesTurn?.workspaceFiles }
+
     func attachmentRawData(path: String) async -> Data? {
         await attachmentCoordinator.attachmentRawData(path: path)
     }
 
+    /// A transcript MEDIA image's inline thumbnail: a Hermes session's from its host (#1112), a
+    /// webui chat's through `/api/media`. Nil when it can't load.
     func transcriptMediaThumbnailData(for reference: TranscriptMediaReference) async -> Data? {
-        await attachmentCoordinator.transcriptMediaThumbnailData(for: reference)
+        guard let hermesTurn else { return await attachmentCoordinator.transcriptMediaThumbnailData(for: reference) }
+        guard reference.isRasterImageCandidate,
+              let data = await hermesTranscriptMediaData(for: reference, from: hermesTurn,
+                                                         limit: BotArtifactBuffer.maximumBytes) else { return nil }
+        return await ImagePreviewDownsampler.previewDataAsync(
+            from: data,
+            maxPixelSize: ImagePreviewDownsampler.attachmentMaxPixelSize
+        ) ?? data
     }
 
+    /// A transcript MEDIA reference's bytes for inline audio and file export. A Hermes session
+    /// downloads a local path from its host as it does a sent file (#1112), which resolves it
+    /// against the session, in full as webui's `/api/media` does; a remote URL loads as on webui.
+    /// Nil when it can't load.
     func transcriptMediaData(for reference: TranscriptMediaReference) async -> Data? {
-        await attachmentCoordinator.transcriptMediaData(for: reference)
+        guard let hermesTurn else { return await attachmentCoordinator.transcriptMediaData(for: reference) }
+        return await hermesTranscriptMediaData(for: reference, from: hermesTurn, limit: nil)
+    }
+
+    private func hermesTranscriptMediaData(for reference: TranscriptMediaReference, from turn: HermesChatTurnCoordinator,
+                                           limit: Int?) async -> Data? {
+        switch reference.source {
+        case let .localPath(path): return try? await turn.attachmentData(path: path, limit: limit)
+        case let .remoteURL(url): return try? await client.remoteTranscriptMediaData(from: url)
+        }
     }
 
     /// Reloads the newest transcript window from the server. `usesInitialPrefetch`

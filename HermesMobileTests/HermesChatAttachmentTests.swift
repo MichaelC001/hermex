@@ -376,6 +376,78 @@ import UIKit
         XCTAssertNotEqual(base, namespace(Self.connection, "work"))
     }
 
+    // MARK: Workspace (#1112)
+
+    /// The chat's workspace is its Profile, stored key, and the folder and terminal backend
+    /// `session.info` names; a later report moving the folder moves it, and its files download
+    /// on the chat's connection by their relative path. Before any report names a folder there is none.
+    func testTheWorkspaceFollowsSessionInfoAndReadsOnTheChatsConnection() async throws {
+        let chat = await openChat()
+        XCTAssertNil(chat.model.hermesWorkspace, "no session.info has named a folder")
+
+        chat.receive(event(1, "session.info", ["cwd": .string("/work/app"), "terminal_backend": .string("local")]))
+        XCTAssertEqual(chat.model.hermesWorkspace, HermesWorkspaceContext(
+            server: URL(string: "https://hermes.example")!, profile: "default", storedKey: "tip",
+            cwd: "/work/app", terminalBackend: "local"))
+
+        chat.receive(event(2, "session.info", ["cwd": .string("/work/moved"), "terminal_backend": .string("docker")]))
+        XCTAssertEqual(chat.model.hermesWorkspace?.cwd, "/work/moved")
+        XCTAssertEqual(chat.model.hermesWorkspace?.isLocal, false)
+
+        var query: [URLQueryItem]?
+        _ = HermesHostFixture.configuration { request in
+            guard request.url?.path == "/api/fs/download" else { return nil }
+            query = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems }
+            return .json(200, .string("bytes"))
+        }
+        _ = try await XCTUnwrap(chat.model.hermesWorkspaceFiles).rawFileData(path: "out/report.pdf")
+        XCTAssertEqual(query, [URLQueryItem(name: "path", value: "out/report.pdf"),
+                               URLQueryItem(name: "profile", value: "default"),
+                               URLQueryItem(name: "session_id", value: "tip")])
+    }
+
+    /// A MEDIA reference's inline audio, video or file in a reply downloads from the host by
+    /// the path the reply wrote, under the session's Profile and stored key, so the host
+    /// resolves it against the session; webui's `/api/media` is never asked.
+    func testInlineTranscriptMediaDownloadsFromTheHost() async throws {
+        let chat = await openChat()
+        var query: [URLQueryItem]?
+        _ = HermesHostFixture.configuration { request in
+            guard request.url?.path == "/api/fs/download" else { return nil }
+            query = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems }
+            return .json(200, .string("audio"))
+        }
+
+        let data = await chat.model.transcriptMediaData(for: TranscriptMediaReference(rawReference: "/tmp/report.wav"))
+
+        XCTAssertEqual(data, Data(#""audio""#.utf8))
+        XCTAssertEqual(query, [URLQueryItem(name: "path", value: "/tmp/report.wav"),
+                               URLQueryItem(name: "profile", value: "default"),
+                               URLQueryItem(name: "session_id", value: "tip")])
+        XCTAssertFalse(HermesHostFixture.requests.contains { $0.url?.path == "/api/media" })
+    }
+
+    /// A MEDIA file's export downloads all of it, past the 25 MB that stops a MEDIA image's
+    /// thumbnail, on the same session's Profile and stored key.
+    func testInlineTranscriptMediaFileExportHasNoPreviewCap() async throws {
+        let chat = await openChat()
+        let large = String(repeating: "a", count: BotArtifactBuffer.maximumBytes)
+        _ = HermesHostFixture.configuration { request in
+            request.url?.path == "/api/fs/download" ? .json(200, .string(large)) : nil
+        }
+
+        let export = await chat.model.transcriptMediaData(for: TranscriptMediaReference(rawReference: "/tmp/archive.zip"))
+        let thumbnail = await chat.model.transcriptMediaThumbnailData(for: TranscriptMediaReference(rawReference: "/tmp/huge.png"))
+
+        XCTAssertEqual(export?.count, BotArtifactBuffer.maximumBytes + 2)
+        XCTAssertNil(thumbnail)
+        let downloads = HermesHostFixture.requests.filter { $0.url?.path == "/api/fs/download" }
+        XCTAssertEqual(downloads.first.flatMap { $0.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems } },
+                       [URLQueryItem(name: "path", value: "/tmp/archive.zip"), URLQueryItem(name: "profile", value: "default"),
+                        URLQueryItem(name: "session_id", value: "tip")])
+        XCTAssertEqual(downloads.count, 2)
+    }
+
     // MARK: Fixture
 
     private static let connection = BotConnection(id: UUID(), name: "Mac", address: URL(string: "http://hermes.local:9120")!,

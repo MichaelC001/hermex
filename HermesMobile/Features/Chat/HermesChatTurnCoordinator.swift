@@ -128,8 +128,12 @@ struct HermesChatTranscript: Equatable {
     /// The last title `session.info` reported, so a repeat leaves the header alone.
     @ObservationIgnored private var infoTitle: String?
     /// The session's working folder, as the latest `session.info` or attach reports it.
-    /// `/clear` starts its new chat there (#1050).
-    @ObservationIgnored private(set) var cwd: String?
+    /// `/clear` starts its new chat there (#1050); Files reads it (#1112). A Move to Project
+    /// changes it.
+    private(set) var cwd: String?
+    /// The terminal backend the session runs commands on (`local`, `docker`, …), as the same
+    /// reports name it (#1112).
+    private(set) var terminalBackend: String?
     /// The session's model and provider, as the latest `session.info` or attach reports them:
     /// `/clear`'s new chat takes it while the model chip has no choice to offer (#1050).
     @ObservationIgnored private(set) var reportedModel: HermesCall.Model?
@@ -401,15 +405,32 @@ struct HermesChatTranscript: Equatable {
     /// thumbnail and preview. Downloads through this attach as Bot Chat does
     /// (`HermesREST.downloadArtifact` with the session's Profile and stored key), so the
     /// host resolves a relative `@file:` path against the session. Throws `.stale` while
-    /// detached, and for a result that lands after a reattach or a cancel.
-    func attachmentData(path: String) async throws -> Data {
+    /// detached, and for a result that lands after a reattach or a cancel. `limit` caps a
+    /// preview at 25 MB; a MEDIA file's export passes nil for the whole file (#1112).
+    func attachmentData(path: String, limit: Int? = BotArtifactBuffer.maximumBytes) async throws -> Data {
         guard engine.connectionState == .connected, let key = engine.storedKey else { throw BotFailure.stale }
         let attempt = engine.generation
         let context = BotArtifactContext(connectionID: engine.connection.id, profile: engine.target.profile,
                                          sessionID: key, generation: attempt)
-        let data = try await engine.wire.artifactData(path: path, context: context)
+        let data = try await engine.wire.artifactData(path: path, context: context, limit: limit)
         try engine.check(attempt)
         return data
+    }
+
+    /// This chat's working folder on its host (#1112), once the session has a stored key and
+    /// `session.info` has named its folder; nil before.
+    var workspace: HermesWorkspaceContext? {
+        guard let cwd, let key = engine.storedKey else { return nil }
+        return HermesWorkspaceContext(server: engine.server, profile: engine.target.profile, storedKey: key,
+                                      cwd: cwd, terminalBackend: terminalBackend)
+    }
+
+    /// `workspace`'s files, on this chat's connection, whatever its backend: MEDIA references
+    /// read through it, and Files and file links only on a local backend
+    /// (`HermesWorkspaceContext.isLocal`).
+    var workspaceFiles: HermesWorkspaceFileClient? {
+        guard let workspace, let http = (engine.wire as? BotClient)?.http else { return nil }
+        return HermesWorkspaceFileClient(context: workspace, http: http)
     }
 
     /// Keys this session's thumbnails in the process-wide `TranscriptImageCache`: its
@@ -866,9 +887,12 @@ struct HermesChatTranscript: Equatable {
         if !hostRunning { finish(ending) }
     }
 
-    /// Keeps the working folder and the model a `session.info` or a snapshot's `info` reports.
+    /// Keeps the working folder, terminal backend and model a `session.info` or a snapshot's
+    /// `info` reports. An unchanged folder or backend is not written again, so a repeated
+    /// report invalidates nothing.
     private func noteInfo(_ info: BotJSON) {
-        if let folder = Self.words(info["cwd"]) { cwd = folder }
+        if let folder = Self.words(info["cwd"]), folder != cwd { cwd = folder }
+        if let backend = Self.words(info["terminal_backend"]), backend != terminalBackend { terminalBackend = backend }
         if let model = Self.words(info["model"]), let provider = Self.words(info["provider"]) {
             reportedModel = HermesCall.Model(id: model, provider: provider)
         }

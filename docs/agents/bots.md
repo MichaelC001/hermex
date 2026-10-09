@@ -860,8 +860,8 @@ signed-in connection using `GET /api/fs/download?path=…&profile=…&session_id
 Relative paths are resolved by the host's session cwd; no iOS filesystem base or
 webui transport is used. Known same-origin media/download links contribute only
 their path; embedded auth tokens and identity overrides are discarded. Redirects
-are rejected. Each response is capped at 25 MB, including chunked responses with
-no length header. Disconnect cancels downloads, stale completions are rejected,
+are rejected. Each preview response is capped at 25 MB, including chunked responses
+with no length header; a Hermes chat's MEDIA file export reads the whole file (#1112). Disconnect cancels downloads, stale completions are rejected,
 and dismissal removes the preview's temporary file. No persistent artifact cache
 is shared between conversations. Missing routes, denied files and unknown formats
 leave an explicit preview failure or the native viewer's unsupported-file state.
@@ -1448,6 +1448,47 @@ shows the start with a "Preview truncated" note. `/api/fs/*` takes any host path
 path is the folder joined with names from its own listing, never the listing's `path`, which
 the host resolves (`/private/var/…` on a Mac). A name that is empty, `.`, `..` or holds a
 separator is refused before any request.
+
+## Workspace on a Hermes host
+
+A Hermes chat's Files, its previews, transcript file links and MEDIA references read the host
+through `HermesWorkspaceFileClient` (#1112), the `WorkspaceFileClient` beside webui's
+`WebUIWorkspaceFileClient`. The chat's workspace (`HermesWorkspaceContext`) is its server,
+Profile, stored key, and the `cwd` and `terminal_backend` the latest `session.info` or attach
+reports; a Move to Project changes `cwd`, and the open tree drops everything and lists the new
+folder. Files and file links show only on a `local` backend, where the folder is on the host the
+dashboard reads; any other backend, or no `session.info` yet, hides them. The composer's `@`
+panel (#1113) and Git (#1114) read the same context.
+
+- **Fence.** `/api/fs/*` reads any host path a signed-in client names, so the fence is the
+  client's rule, not a security boundary. Paths across the seam are workspace-relative; only the
+  Hermes client composes `cwd + "/" + path`, and it refuses an absolute path, a `..` component
+  or a path with nothing past the root before any request. A child's path is its folder's plus
+  its `name`, never the listing's `path`, which the host resolves (`/private/var/…` on a Mac) and
+  so may not start with the `cwd` that was asked for. Downloads (`/api/fs/download`) send the
+  relative path with `profile` and `session_id`, so the host anchors them to the session's own
+  folder; a MEDIA path goes as the reply wrote it. Rows, previews and errors show relative paths,
+  and a refusal whose `detail` names a path reads as the generic failure.
+- **ENOENT-as-200.** `GET /api/fs/list` answers a folder it can't read with 200
+  `{entries: [], error}`: `ENOENT` or `ENOTDIR` on the root is the folder-missing state, on a
+  subfolder that row's failure; `EACCES` is a permission failure. None reports an error.
+- **Hidden folders.** The listing hides `.git .hg .svn .cache .next .turbo .venv __pycache__
+  build dist node_modules target venv` and credential files, as Desktop does; the app adds no
+  workaround. A symlinked folder lists as a file, so it is not browsable and opens the preview's
+  "can't preview" state.
+- **Reads.** `GET /api/fs/read-text` is the first 512 KiB, decoded with replacement
+  characters, so it is only a preview: Save and Share always download the file. `binary` shows
+  No Preview, and `truncated` shows the start with a "Preview truncated" note, without a line
+  count. A symlinked folder answers 400 `Path points to a directory` to `read-text` and
+  `download` alike (`BotArtifactFailure.folder`), which shows No Preview whatever its name.
+  Image, Quick Look and MEDIA previews and MEDIA thumbnails stop at 25 MB; Save and Share (of a
+  file, or of a MEDIA image or video whose preview stopped there), and an inline MEDIA file's
+  export and audio, have no cap, as on webui. Save and Share accept an empty file; every other
+  download treats an empty body as a failed read. Inline MEDIA in the
+  transcript downloads as sent files do, on the session's Profile and stored key.
+- **Caches.** The tree's expansion is kept per server, Profile, stored key and `cwd`, so two
+  chats in one folder never share it. A `cwd` change closes a file preview or file link opened
+  from the old folder.
 
 ## Memory on a Hermes host
 
