@@ -462,7 +462,8 @@ final class ChatViewModel {
     @ObservationIgnored private var checkedFileChipCandidates: Set<String> = []
     /// Bumped whenever the confirmed paths are thrown away because the
     /// workspace moved. The chat re-runs its confirmation pass on the change, so
-    /// a file that exists in the new workspace too comes back as a chip.
+    /// a file that exists in the new workspace too comes back as a chip, and a
+    /// pass started under an older revision applies nothing.
     private(set) var fileChipScopeRevision = 0
     /// Bumped whenever the transcript is replaced rather than extended: a
     /// cache-first paint, the server's reconcile, a page of older messages. A
@@ -4326,6 +4327,36 @@ final class ChatViewModel {
         }
     }
 
+    /// Where this chat's `@` panel and `@path` chips look files up: a webui session's workspace
+    /// listings, or a Hermes chat's `complete.path` while its folder is on a `local` backend,
+    /// the same gate as Files (#1113). Nil closes the panel and leaves `@…` as text.
+    private enum FileReferenceSource {
+        case webui(sessionID: String)
+        case hermes(HermesChatTurnCoordinator)
+    }
+
+    private var fileReferenceSource: FileReferenceSource? {
+        if let hermesTurn { return hermesTurn.workspace?.isLocal == true ? .hermes(hermesTurn) : nil }
+        guard let sessionID, !sessionID.isEmpty else { return nil }
+        return .webui(sessionID: sessionID)
+    }
+
+    /// Whether the composer opens its `@` panel for this chat.
+    var offersFilePathSearch: Bool { fileReferenceSource != nil }
+
+    /// One query's rows for the composer's `@` panel, into `filePathSearch`. A Hermes chat's
+    /// host ranks its own rows; a webui chat's folder is listed and ranked here.
+    func searchFilePaths(_ query: String) async {
+        switch fileReferenceSource {
+        case .webui(let sessionID):
+            await filePathSearch.search(query, sessionID: sessionID, apiClient: client)
+        case .hermes(let turn):
+            await filePathSearch.search(query) { try await turn.completeFilePaths($0) }
+        case nil:
+            return
+        }
+    }
+
     /// Remembers a workspace file the user picked in the composer, so its
     /// `@path` draws as a chip there and in the sent message.
     ///
@@ -4353,29 +4384,31 @@ final class ChatViewModel {
     /// dies when the chat is left — so on the way back in, and on any other
     /// device, the only thing that knows a `@word` is a file is the server. Each
     /// candidate's parent folder is listed once, through the same cache the `@`
-    /// panel fills, and every candidate the listing contains becomes a chip in
-    /// both the composer and the transcript.
+    /// panel fills (a Hermes chat asks `complete.path` instead), and every
+    /// candidate the listing contains becomes a chip in both the composer and
+    /// the transcript.
     ///
     /// The work lives on a task this view model owns, like the skill loader: a
     /// caller cancelled by an unrelated view update cannot take the listings
     /// down with it, and a caller arriving mid-pass waits for that pass rather
     /// than starting a second one over the same folders.
     func loadFileChipReferences(draft: String) async {
-        guard let sessionID, !sessionID.isEmpty else { return }
-
         while let existing = fileChipReferenceLoad {
             await existing.value
         }
 
+        // Resolved after the wait: the workspace may have moved meanwhile, such as a Hermes
+        // folder leaving the `local` backend, which closes the source.
+        guard let source = fileReferenceSource else { return }
         let candidates = fileChipReferenceCandidates(draft: draft)
         guard !candidates.isEmpty else { return }
 
-        let workspace = currentWorkspace
+        let scope = fileChipScopeRevision
         fileChipReferenceLoadGeneration &+= 1
         let loadGeneration = fileChipReferenceLoadGeneration
         let load = Task { [weak self] in
             guard let self else { return }
-            await self.confirmFileChipReferences(candidates, sessionID: sessionID, workspace: workspace)
+            await self.confirmFileChipReferences(candidates, source: source, scope: scope)
             guard loadGeneration == self.fileChipReferenceLoadGeneration else { return }
             self.fileChipReferenceLoad = nil
         }
@@ -4389,9 +4422,10 @@ final class ChatViewModel {
     /// one has to take the chips with it — including the ones accepted from the
     /// panel, which were never checked against anything else. The revision bump
     /// is what asks the chat for a fresh pass, so a file that exists under the
-    /// new root as well comes straight back.
-    private func resetFileChipReferences() {
-        filePathSearch.reset()
+    /// new root as well comes straight back. `reloadingOpenQuery` also reloads an
+    /// open `@` panel (`ComposerFilePathSearch.reset(reloadingOpenQuery:)`).
+    private func resetFileChipReferences(reloadingOpenQuery: Bool = false) {
+        filePathSearch.reset(reloadingOpenQuery: reloadingOpenQuery)
         checkedFileChipCandidates.removeAll()
         // Cancelling, not just forgetting: a pass left running would keep
         // listing the old root's folders, and every folder it had already
@@ -4438,11 +4472,12 @@ final class ChatViewModel {
     /// A folder whose listing failed leaves its candidates unanswered rather
     /// than answered "no", so the next pass retries them; a folder that answered
     /// marks its candidates settled, which is what keeps a `@word` that is not a
-    /// file from costing a request on every transcript update.
+    /// file from costing a request on every transcript update. `scope` is the
+    /// `fileChipScopeRevision` the pass started under; nothing applies once it moves.
     private func confirmFileChipReferences(
         _ candidates: [String],
-        sessionID: String,
-        workspace: String?
+        source: FileReferenceSource,
+        scope: Int
     ) async {
         var wantedByDirectory: [String: Set<String>] = [:]
         var directories: [String] = []
@@ -4471,32 +4506,55 @@ final class ChatViewModel {
                 // and nothing it has learned since may be applied.
                 guard !Task.isCancelled else { return }
                 guard let wanted = wantedByDirectory[directory] else { continue }
-                guard let entries = try? await filePathSearch.entries(
-                    in: directory,
-                    sessionID: sessionID,
-                    apiClient: client
-                ) else {
+                guard let lookup = try? await listedFileReferences(wanted, in: directory, source: source) else {
                     // A listing that failed is not an answer. Leaving the
                     // candidates open is what lets the next pass retry them.
                     continue
                 }
 
-                confirmed.formUnion(wanted.intersection(Set(entries.map(\.path))))
-                settled.formUnion(wanted)
+                confirmed.formUnion(lookup.listed)
+                settled.formUnion(lookup.answered)
             }
 
             // Checked between batches as well as at the end: the chat can be
             // left, or its workspace switched, part-way through a long pass, and
             // a listing taken against the old root must never widen the new
             // one's catalog.
-            guard !Task.isCancelled,
-                  sessionID == self.sessionID,
-                  workspace == currentWorkspace
-            else {
-                return
-            }
+            guard !Task.isCancelled, scope == fileChipScopeRevision else { return }
 
             apply(confirmed: confirmed, settled: settled)
+        }
+    }
+
+    /// Which of `wanted`, all in `directory`, the source lists there (`listed`), and which of
+    /// them it gave an answer for at all (`answered`).
+    ///
+    /// A webui folder is listed once, through the cache the `@` panel fills, so it answers all
+    /// of `wanted` or throws. A Hermes chat asks `complete.path` for each candidate's own path:
+    /// the host lists the folder's entries that start with the name, so a folder past its
+    /// 30-row cap still confirms one. One candidate's failed lookup leaves only that candidate
+    /// unanswered; its siblings keep their answers.
+    private func listedFileReferences(
+        _ wanted: Set<String>,
+        in directory: String,
+        source: FileReferenceSource
+    ) async throws -> (listed: Set<String>, answered: Set<String>) {
+        switch source {
+        case .webui(let sessionID):
+            let entries = try await filePathSearch.entries(in: directory, sessionID: sessionID, apiClient: client)
+            return (wanted.intersection(entries.map(\.path)), wanted)
+        case .hermes(let turn):
+            var listed: Set<String> = []
+            var answered: Set<String> = []
+            for candidate in wanted.sorted() {
+                guard !Task.isCancelled else { throw CancellationError() }
+                guard let entries = try? await turn.completeFilePaths(candidate) else { continue }
+                answered.insert(candidate)
+                if entries.contains(where: { $0.path == candidate }) {
+                    listed.insert(candidate)
+                }
+            }
+            return (listed, answered)
         }
     }
 
@@ -7715,6 +7773,11 @@ extension ChatViewModel: HermesChatTurnDelegate {
         currentGoal = goal
         // The goal menu shows once the session has a goal, and stays to set the next one.
         if goal != nil { hasActivatedGoalCommand = true }
+    }
+
+    func hermesWorkspaceDidChange() {
+        // `session.info` reports a move the host already applied, so an open `@` panel asks again.
+        resetFileChipReferences(reloadingOpenQuery: true)
     }
 }
 

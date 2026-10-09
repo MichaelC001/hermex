@@ -1,5 +1,6 @@
 import XCTest
 import Observation
+import SwiftUI
 @testable import HermesMobile
 
 /// A Hermes session in the main chat (#1010): `HermesChatTurnCoordinator` reducing the
@@ -317,6 +318,184 @@ import Observation
         XCTAssertNil(chat.model.queuedMessagesReceipt)
     }
 
+    // MARK: `@` file references (#1113)
+
+    /// The `@` panel opens only once `session.info` names a folder on a `local` backend, then
+    /// asks `complete.path` on the attached runtime under the session's Profile; a picked folder
+    /// asks again for what is inside it.
+    func testTheAtPanelCompletesPathsOnTheCurrentRuntimeOfALocalBackend() async {
+        let chat = await openChat()
+        XCTAssertFalse(chat.model.offersFilePathSearch, "no session.info has named a folder")
+        chat.receive(event(1, "session.info", ["cwd": .string("/work/app"), "terminal_backend": .string("docker")]))
+        XCTAssertFalse(chat.model.offersFilePathSearch, "a docker folder is not on the host")
+        await chat.model.searchFilePaths("Sou")
+        XCTAssertEqual(chat.writes("complete.path").count, 0, "a closed panel asks nothing")
+
+        chat.receive(event(2, "session.info", ["terminal_backend": .string("local")]))
+        XCTAssertTrue(chat.model.offersFilePathSearch)
+        chat.host.next("complete.path", .init(result: completions(["Sources/": "dir", "Sourcery.yml": ""])))
+        await chat.model.searchFilePaths("Sou")
+        XCTAssertEqual(chat.model.filePathSearch.matches.map(\.path), ["Sources", "Sourcery.yml"])
+        XCTAssertEqual(chat.model.filePathSearch.matches.map(\.isDirectory), [true, false])
+
+        chat.host.next("complete.path", .init(result: completions(["Sources/App.swift": ""])))
+        await chat.model.searchFilePaths("Sources/")
+        XCTAssertEqual(chat.model.filePathSearch.matches.map(\.path), ["Sources/App.swift"])
+        XCTAssertEqual(chat.writes("complete.path"), [
+            ["word": .string("Sou"), "session_id": .string("runtime"), "profile": .string("default")],
+            ["word": .string("Sources/"), "session_id": .string("runtime"), "profile": .string("default")]
+        ])
+    }
+
+    /// Rows for a folder the chat has moved away from never show: a reply that lands after
+    /// `session.info` names a new folder is dropped.
+    func testAPanelReplyThatLandsAfterTheFolderMovedIsDropped() async {
+        let chat = await openChat()
+        chat.receive(event(1, "session.info", ["cwd": .string("/work/app"), "terminal_backend": .string("local")]))
+        chat.host.next("complete.path", .init(result: completions(["Sources/": "dir"]), before: [
+            event(2, "session.info", ["cwd": .string("/work/moved")])
+        ]))
+
+        await chat.model.searchFilePaths("Sou")
+
+        XCTAssertEqual(chat.writes("complete.path").count, 1)
+        XCTAssertEqual(chat.model.filePathSearch.matches, [])
+        XCTAssertFalse(chat.model.filePathSearch.isLoading)
+    }
+
+    /// An `@path` in the draft or a sent message becomes a chip when `complete.path` lists it;
+    /// one it doesn't list stays text and is not asked about again.
+    func testAnAtPathBecomesAChipOnlyWhenTheHostListsIt() async {
+        let chat = await openChat()
+        chat.receive(event(1, "session.info", ["cwd": .string("/work/app"), "terminal_backend": .string("local")]))
+        chat.host.next("complete.path", .init(result: completions(["Sources/App.swift": "", "Sources/App.swift.orig": ""])))
+        chat.host.next("complete.path", .init(result: completions([:])))
+
+        await chat.model.loadFileChipReferences(draft: "read @Sources/App.swift and @nope.md")
+
+        XCTAssertEqual(chat.model.fileChipPaths, ["Sources/App.swift"])
+        XCTAssertEqual(chat.writes("complete.path").map { $0["word"]?.text }, ["Sources/App.swift", "nope.md"])
+        await chat.model.loadFileChipReferences(draft: "read @Sources/App.swift and @nope.md")
+        XCTAssertEqual(chat.writes("complete.path").count, 2, "a settled candidate is not asked again")
+    }
+
+    /// A failed lookup leaves only its own candidate open: a sibling the host confirmed in the
+    /// same folder still becomes a chip and is not asked about again.
+    func testAFailedLookupKeepsItsSiblingsAnswers() async {
+        let chat = await openChat()
+        chat.receive(event(1, "session.info", ["cwd": .string("/work/app"), "terminal_backend": .string("local")]))
+        chat.host.next("complete.path", .init(result: completions(["a.md": ""])))
+        chat.host.next("complete.path", .init(error: -32000))
+
+        await chat.model.loadFileChipReferences(draft: "see @a.md and @b.md")
+
+        XCTAssertEqual(chat.model.fileChipPaths, ["a.md"])
+        chat.host.next("complete.path", .init(result: completions(["b.md": ""])))
+        await chat.model.loadFileChipReferences(draft: "see @a.md and @b.md")
+        XCTAssertEqual(chat.writes("complete.path").map { $0["word"]?.text }, ["a.md", "b.md", "b.md"])
+        XCTAssertEqual(chat.model.fileChipPaths, ["a.md", "b.md"])
+    }
+
+    /// Move to Project takes the old folder's chips with it, and a confirmation that lands after
+    /// the move counts for nothing: the next pass asks again in the new folder.
+    func testAFolderMoveDropsChipsAndAStaleConfirmation() async {
+        let chat = await openChat()
+        chat.receive(event(1, "session.info", ["cwd": .string("/work/app"), "terminal_backend": .string("local")]))
+        chat.model.recordFileChipReference("picked.md")
+        XCTAssertEqual(chat.model.fileChipPaths, ["picked.md"])
+
+        let revision = chat.model.fileChipScopeRevision
+        chat.receive(event(2, "session.info", ["cwd": .string("/work/moved")]))
+        XCTAssertEqual(chat.model.fileChipPaths, [])
+        XCTAssertNotEqual(chat.model.fileChipScopeRevision, revision, "the chat re-checks in the new folder")
+
+        chat.host.next("complete.path", .init(result: completions(["README.md": ""]), before: [
+            event(3, "session.info", ["cwd": .string("/work/elsewhere")])
+        ]))
+        await chat.model.loadFileChipReferences(draft: "see @README.md")
+        XCTAssertEqual(chat.model.fileChipPaths, [], "the reply described the folder before the move")
+
+        chat.host.next("complete.path", .init(result: completions(["README.md": ""])))
+        await chat.model.loadFileChipReferences(draft: "see @README.md")
+        XCTAssertEqual(chat.model.fileChipPaths, ["README.md"])
+        XCTAssertEqual(chat.writes("complete.path").count, 2)
+    }
+
+    /// A `complete.path` the host never answers empties the panel and leaves the candidate
+    /// open; the chat keeps its connection and its next call is answered.
+    func testAnUnansweredCompletionFailsOnlyItself() async throws {
+        let chat = await openChat(rpcDeadline: .milliseconds(50))
+        chat.receive(event(1, "session.info", ["cwd": .string("/work/app"), "terminal_backend": .string("local")]))
+        let resumes = chat.writes("session.resume").count
+        chat.host.withhold("complete.path")
+
+        await chat.model.searchFilePaths("Sou")
+        await chat.model.loadFileChipReferences(draft: "see @README.md")
+
+        XCTAssertEqual(chat.writes("complete.path").count, 2)
+        XCTAssertEqual(chat.model.filePathSearch.matches, [])
+        XCTAssertFalse(chat.model.filePathSearch.isLoading)
+        XCTAssertEqual(chat.model.fileChipPaths, [])
+        XCTAssertEqual(chat.turn.engine.connectionState, .connected)
+        let reply = try await chat.turn.engine.request(.subagentList(sessionID: "runtime"), attempt: chat.turn.engine.generation)
+        XCTAssertEqual(reply["subagents"].list, [])
+        XCTAssertEqual(chat.writes("session.resume").count, resumes, "the chat never reattached")
+    }
+
+    /// A chip pass that waited behind another starts against the backend it finds: once
+    /// `session.info` moves the folder off `local`, it asks nothing.
+    func testAWaitingChipPassRechecksTheBackend() async {
+        let chat = await openChat(rpcDeadline: .seconds(5))
+        chat.receive(event(1, "session.info", ["cwd": .string("/work/app"), "terminal_backend": .string("local")]))
+        chat.host.withhold("complete.path")
+        let asked = expectation(description: "the first pass asks")
+        chat.host.expect(asked, onNext: "complete.path")
+        let first = Task { await chat.model.loadFileChipReferences(draft: "see @README.md") }
+        await fulfillment(of: [asked], timeout: 2)
+        let second = Task { await chat.model.loadFileChipReferences(draft: "see @README.md") }
+        await Task.yield() // the second caller reaches its wait behind the first pass
+
+        chat.receive(event(2, "session.info", ["terminal_backend": .string("docker")]))
+        await first.value
+        await second.value
+
+        XCTAssertFalse(chat.model.offersFilePathSearch)
+        XCTAssertEqual(chat.writes("complete.path").count, 1)
+        XCTAssertEqual(chat.model.fileChipPaths, [])
+    }
+
+    /// An open `@` panel asks again when the folder moves under the same query, even while
+    /// the old folder's reply is still on its way.
+    func testAnOpenPanelReloadsInTheNewFolder() async throws {
+        let chat = await openChat()
+        chat.receive(event(1, "session.info", ["cwd": .string("/work/app"), "terminal_backend": .string("local")]))
+        chat.host.next("complete.path", .init(result: completions(["Sources/": "dir"]), before: [
+            event(2, "session.info", ["cwd": .string("/work/moved")])
+        ]))
+        chat.host.next("complete.path", .init(result: completions(["Sourdough.md": ""])))
+        let reloaded = expectation(description: "the panel loads its query again")
+        var loads = 0
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = UIHostingController(rootView: FilePathAutocompleteView(
+            query: "Sou", search: chat.model.filePathSearch, load: { query in
+                loads += 1
+                if loads == 2 { reloaded.fulfill() }
+                await chat.model.searchFilePaths(query)
+            }, onSelect: { _ in }
+        ))
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+
+        await fulfillment(of: [reloaded], timeout: 5)
+        guard loads == 2 else { return }
+        await waitUntil("the new folder's rows") { chat.model.filePathSearch.matches.map(\.path) == ["Sourdough.md"] }
+        XCTAssertEqual(chat.writes("complete.path").map { $0["word"]?.text }, ["Sou", "Sou"])
+    }
+
     // MARK: Reattach
 
     /// Back from the background mid-turn: the replay carries what was missed, the reply
@@ -429,7 +608,7 @@ import Observation
 
     private func openChat(runtime: String = "runtime", key: String = "tip", profile: String = "default",
                           target: ConversationTarget? = nil, drafts: ChatDraftStore? = nil,
-                          history: [BotJSON] = []) async -> Chat {
+                          history: [BotJSON] = [], rpcDeadline: Duration = .seconds(30)) async -> Chat {
         addTeardownBlock { HermesHostFixture.reset() }
         let host = BotSocketHost()
         host.always("session.resume", .init(result: resume(running: false, runtime: runtime, key: key, profile: profile)))
@@ -439,7 +618,7 @@ import Observation
             "session_id": .string(runtime), "stored_session_id": .string(key), "message_count": .number(0),
             "messages": .array([]), "info": .object(["profile_name": .string(profile)])
         ])))
-        let client = BotClient(http: host.connection(Self.connection))
+        let client = BotClient(http: host.connection(Self.connection, rpcDeadline: rpcDeadline))
         serveHistory(history, key: key)
         let engine = HermesConversation(server: URL(string: "https://hermes.example")!, connection: Self.connection,
                                         target: target ?? .session(profile: profile, key: key), wire: client)
@@ -514,6 +693,13 @@ import Observation
     private func event(_ seq: Int, _ type: String, _ payload: [String: BotJSON] = [:], runtime: String = "runtime") -> BotJSON {
         .object(["session_id": .string(runtime), "seq": .number(Double(seq)), "type": .string(type),
                  "payload": .object(payload)])
+    }
+
+    /// A `complete.path` reply listing `rows`, path to `meta`, in order.
+    private func completions(_ rows: KeyValuePairs<String, String>) -> BotJSON {
+        .object(["items": .array(rows.map { text, meta in
+            .object(["text": .string(text), "display": .string(text), "meta": .string(meta)])
+        })])
     }
 
     /// A saved prompt as a transcript page carries it (#1047).

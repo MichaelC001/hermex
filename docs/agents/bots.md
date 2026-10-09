@@ -1489,6 +1489,15 @@ panel (#1113) and Git (#1114) read the same context.
 - **Caches.** The tree's expansion is kept per server, Profile, stored key and `cwd`, so two
   chats in one folder never share it. A `cwd` change closes a file preview or file link opened
   from the old folder.
+- **`@` panel and chips (#1113).** The composer's `@` panel asks `complete.path` on the
+  attached runtime, as Bot Chat does, not `/api/fs/list`: the host completes against the
+  session's `cwd` and ranks and caps its own rows (30). An `@path` in the draft or transcript
+  becomes a chip when `complete.path` for that path lists it, so a big folder still confirms
+  it. Same `local` gate as Files. A `cwd` or backend change drops the chips and the pass in
+  flight, and the chat checks again in the new folder; an open panel asks again there (a
+  webui switch does not reload it: that switch is optimistic). A `complete.path` with no
+  reply fails only that lookup, never the chat's connection; Bot Chat's still ends its
+  connection, as before.
 
 ## Memory on a Hermes host
 
