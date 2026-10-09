@@ -2162,6 +2162,20 @@ has no session-only personality) and also switches the session, so
 `/personality <name>` asks first and names the Profile. Its list is
 `complete.slash {text: "/personality ", session_id}`.
 
+A Hermes session's folder chip (#1117) shows the `cwd` its `session.info` reports, as does the
+chat's header. Its picker has no workspace registry to manage: untyped, it lists the chat's
+folder, the Profile's user projects' folders (`projects.tree {profile}`, automatic lanes left
+out) and the `cwd`s on the first page of the Profile's Sessions list, each once; a path from `/`
+or `~/` completes through `complete.path {word, profile}` outside a session, and any other text
+filters the list. A pick is Move to Project's `session.workspace.move {session_key, cwd,
+profile}`, not Bot Chat's `session.cwd.set`, so the stored row keeps the folder. A new chat
+nothing can have run in (no prompt reached the socket, whatever its reply, no turn started, no
+saved rows) moves at once: the host re-homes its live runtime and the first prompt's row inherits
+the folder. Any other asks first in Move to Project's words. The client refuses while a reply
+runs, though the host would move it mid-turn, and checks again at the socket write, since another
+client can start a turn meanwhile. 4017 says the folder doesn't exist. A move is a `cwd` change
+like any other: Files, the `@path` chips and Git leave the old folder (#1112–#1116).
+
 **Accepted host limitation (#479):** in the compatibility pin's
 `tui_gateway/methods_config_set.py`, `_set_reasoning` and `_set_fast` fall back to
 writing Profile config if the runtime disappears, even with `scope: session`.

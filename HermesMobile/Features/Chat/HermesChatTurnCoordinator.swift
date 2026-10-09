@@ -37,8 +37,9 @@ import SwiftData
     func hermesBackgroundDidChange(_ task: HermesBackgroundTask)
     /// The session's goal, as its control snapshot reports it; nil once cleared (#1013).
     func hermesGoalDidChange(_ goal: SubmittedGoal?)
-    /// `session.info` named another working folder or terminal backend, such as after a Move to
-    /// Project: every `@path` found in the old one no longer means anything (#1113).
+    /// `session.info` or the composer's folder picker (#1117) named another working folder or
+    /// terminal backend, such as after a Move to Project: every `@path` found in the old one no
+    /// longer means anything (#1113).
     func hermesWorkspaceDidChange()
 }
 
@@ -131,8 +132,8 @@ struct HermesChatTranscript: Equatable {
     /// The last title `session.info` reported, so a repeat leaves the header alone.
     @ObservationIgnored private var infoTitle: String?
     /// The session's working folder, as the latest `session.info` or attach reports it.
-    /// `/clear` starts its new chat there (#1050); Files reads it (#1112). A Move to Project
-    /// changes it.
+    /// `/clear` starts its new chat there (#1050); Files reads it (#1112); the composer's folder
+    /// chip and the header show it, and its picker moves it (#1117). A Move to Project changes it.
     private(set) var cwd: String?
     /// The terminal backend the session runs commands on (`local`, `docker`, …), as the same
     /// reports name it (#1112).
@@ -162,6 +163,11 @@ struct HermesChatTranscript: Equatable {
     /// The host accepted a prompt on this chat; until then a new session's draft keeps the
     /// new-session key.
     @ObservationIgnored private var promptAccepted = false
+    /// A prompt reached the socket on this chat, whatever its reply: the host may have run it.
+    @ObservationIgnored private var promptSent = false
+    /// The chat opened as a new session (`.new`), which the host keeps no row for until its
+    /// first accepted prompt.
+    private let opensNew: Bool
     @ObservationIgnored private var attaching: Task<Void, Never>?
     @ObservationIgnored private var attachGeneration = 0
     /// The host refused the saved sign-in: nothing reattaches on its own until the chat
@@ -203,6 +209,7 @@ struct HermesChatTranscript: Equatable {
         settings = HermesChatSettings(engine: engine)
         slashCommands = HermesSlashCommands(engine: engine)
         draftKey = engine.target.draftKey(server: engine.server, connectionID: engine.connection.id)
+        if case .new = engine.target { opensNew = true } else { opensNew = false }
         engine.owner = self
         requests.onOpenChange = { [weak self] in self?.syncLiveActivityWaiting() }
         requests.onFailure = { [weak self] in self?.delegate?.hermesRequestDidFail($0) }
@@ -329,7 +336,7 @@ struct HermesChatTranscript: Equatable {
         let reply: BotJSON
         do {
             reply = try await engine.write(mode.call(runtime: runtime, text: prompt), attempt: attempt,
-                                           runtime: runtime) { dispatched = true }
+                                           runtime: runtime) { dispatched = true; self.promptSent = true }
         } catch {
             // A reaped runtime (4001): reattach to the stored key, which reads only.
             if case BotFailure.rejected(4001) = error { reattach() }
@@ -489,6 +496,51 @@ struct HermesChatTranscript: Equatable {
                                                            profile: engine.target.profile, timesOutLocally: true),
                                              attempt: engine.generation)
         return BotFilePathSearch.matches(from: reply)
+    }
+
+    // MARK: Working folder (#1117)
+
+    /// A new chat nothing can have run in yet: no prompt went out, no turn started and the host
+    /// keeps no rows for it. A folder change there moves no work, so it needn't ask.
+    var isUnstarted: Bool { opensNew && !promptSent && turnsStarted == 0 && history.rows.isEmpty }
+
+    /// A folder move found a reply running at the socket write, and never went out.
+    struct ReplyRunning: Error {}
+
+    /// The folders the composer's folder picker offers before anything is typed: this folder,
+    /// the Profile's project folders (`projects.tree`), then the folders on the first page of its
+    /// Sessions list (`HermesFolderCompletion.choices`). A read that fails leaves its part out.
+    func folderChoices() async -> [String] {
+        let profile = engine.target.profile, attempt = engine.generation
+        let tree = try? await engine.request(.projectsTree(profile: profile), attempt: attempt)
+        let page = try? await engine.wire.sessionPage(profile: profile, offset: 0, archived: false)
+        return HermesFolderCompletion.choices(current: cwd, projects: tree.map(HermesProjectTree.init(reply:)),
+                                              sessions: page?.rows ?? [], profile: profile)
+    }
+
+    /// The host's folders completing the typed path `word` (`complete.path` outside a session),
+    /// none when it can't be completed or the host doesn't answer.
+    func completeFolder(_ word: String) async -> [String] {
+        guard HermesFolderCompletion.completes(word),
+              let reply = try? await engine.request(.completeFolder(word: word, profile: engine.target.profile),
+                                                    attempt: engine.generation) else { return [] }
+        return HermesFolderCompletion.suggestions(from: reply, typed: word).folders
+    }
+
+    /// Moves this session to `folder` with `session.workspace.move`, Move to Project's call: the
+    /// host works there from now on, a live runtime included, and no file moves. `cwd` takes the
+    /// folder the host answers, which leaves the old folder's chips behind as a `session.info`
+    /// move does. Throws the host's refusal as `BotSettingFailure` (a folder it
+    /// lacks is 4017), `.stale` once the attach or runtime it was picked under is gone, and
+    /// `ReplyRunning` when a turn started before it went out: the host would move a live turn.
+    func moveFolder(to folder: String) async throws {
+        guard engine.connectionState == .connected, let runtime = engine.runtime, let key = engine.storedKey
+        else { throw BotFailure.stale }
+        let reply = try await engine.write(.sessionWorkspaceMove(profile: engine.target.profile, storedKey: key, cwd: folder),
+                                           attempt: engine.generation, runtime: runtime) { [weak self] in
+            guard let self, self.isIdle, !self.hostRunning else { throw ReplyRunning() }
+        }
+        noteWorkspace(folder: Self.words(reply["cwd"]), backend: nil)
     }
 
     /// Keys this session's thumbnails in the process-wide `TranscriptImageCache`: its
@@ -946,17 +998,23 @@ struct HermesChatTranscript: Equatable {
     }
 
     /// Keeps the working folder, terminal backend and model a `session.info` or a snapshot's
-    /// `info` reports. An unchanged folder or backend is not written again, so a repeated
-    /// report invalidates nothing; a changed one tells the chat, which drops its `@path` chips.
+    /// `info` reports.
     private func noteInfo(_ info: BotJSON) {
-        let folder = Self.words(info["cwd"]).flatMap { $0 == cwd ? nil : $0 }
-        let backend = Self.words(info["terminal_backend"]).flatMap { $0 == terminalBackend ? nil : $0 }
-        if let folder { cwd = folder }
-        if let backend { terminalBackend = backend }
-        if folder != nil || backend != nil { delegate?.hermesWorkspaceDidChange() }
+        noteWorkspace(folder: Self.words(info["cwd"]), backend: Self.words(info["terminal_backend"]))
         if let model = Self.words(info["model"]), let provider = Self.words(info["provider"]) {
             reportedModel = HermesCall.Model(id: model, provider: provider)
         }
+    }
+
+    /// Keeps a reported working folder and terminal backend, from `session.info` or a folder move
+    /// (#1117). An unchanged one is not written again, so a repeated report invalidates nothing;
+    /// a changed one tells the chat, which drops its `@path` chips.
+    private func noteWorkspace(folder: String?, backend: String?) {
+        let folder = folder.flatMap { $0 == cwd ? nil : $0 }
+        let backend = backend.flatMap { $0 == terminalBackend ? nil : $0 }
+        if let folder { cwd = folder }
+        if let backend { terminalBackend = backend }
+        if folder != nil || backend != nil { delegate?.hermesWorkspaceDidChange() }
     }
 
     /// Settles the turn against an attach's snapshot, then rebuilds the transcript from the
