@@ -6,20 +6,26 @@ struct GitWorkspaceView: View {
     let onAddToPrompt: ((String) -> Void)?
 
     private let git: (any GitDataClient)?
+    private let progress: ReviewProgressStore
     @State private var viewModel: GitWorkspaceViewModel
     @State private var selectedFile: GitFile?
+    /// The latest Try Again load, cancelled by the next one and when the sheet closes.
+    @State private var retryTask: Task<Void, Never>?
     @Environment(\.dismiss) private var dismiss
 
-    /// `git` is the chat's repository client, shared with its toolbar menu.
+    /// `git` is the chat's repository client, shared with its toolbar menu; `progress` is the
+    /// chat's review progress, which each complete status read prunes.
     init(
         git: (any GitDataClient)?,
+        progress: ReviewProgressStore,
         onAPIError: @escaping (Error) -> Void,
         onAddToPrompt: ((String) -> Void)? = nil
     ) {
         self.git = git
         self.onAPIError = onAPIError
         self.onAddToPrompt = onAddToPrompt
-        _viewModel = State(initialValue: GitWorkspaceViewModel(git: git))
+        self.progress = progress
+        _viewModel = State(initialValue: GitWorkspaceViewModel(git: git, progress: progress))
     }
 
     var body: some View {
@@ -38,6 +44,7 @@ struct GitWorkspaceView: View {
                     handleLastError()
                 }
         }
+        .onDisappear { retryTask?.cancel() }
         .presentationDetents([.medium, .large])
         .adaptivePagePresentation()
         .sheet(item: $selectedFile) { file in
@@ -46,6 +53,7 @@ struct GitWorkspaceView: View {
                 git: git,
                 files: viewModel.status?.trackedFiles ?? [file],
                 initialFile: file,
+                progress: progress,
                 onAPIError: onAPIError,
                 onAddToPrompt: onAddToPrompt
             )
@@ -58,7 +66,7 @@ struct GitWorkspaceView: View {
             ProgressView("Loading…").frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if viewModel.errorMessage != nil && viewModel.status == nil {
             unavailable("Could Not Load Changes", image: "exclamationmark.triangle", detail: viewModel.errorMessage) {
-                Task { await reload() }
+                retry()
             }
         } else if viewModel.isNonRepository {
             ContentUnavailableView(
@@ -70,7 +78,7 @@ struct GitWorkspaceView: View {
             statusContent(status)
         } else {
             unavailable("Could Not Load Changes", image: "exclamationmark.triangle", detail: viewModel.errorMessage) {
-                Task { await reload() }
+                retry()
             }
         }
     }
@@ -147,6 +155,11 @@ struct GitWorkspaceView: View {
         } actions: {
             Button("Try Again", action: retry)
         }
+    }
+
+    private func retry() {
+        retryTask?.cancel()
+        retryTask = Task { await reload() }
     }
 
     private func reload() async {

@@ -10,6 +10,8 @@ import Foundation
 final class GitWorkspaceViewModel {
     /// Nil for a webui session without an ID.
     private let git: (any GitDataClient)?
+    /// The chat's review progress, pruned to each successful status read (`ReviewProgressStore`).
+    private let progress: ReviewProgressStore?
 
     private(set) var status: GitStatus?
     private(set) var isLoading = false
@@ -17,8 +19,9 @@ final class GitWorkspaceViewModel {
     private(set) var lastError: Error?
     private var hasLoaded = false
 
-    init(git: (any GitDataClient)?) {
+    init(git: (any GitDataClient)?, progress: ReviewProgressStore? = nil) {
         self.git = git
+        self.progress = progress
     }
 
     convenience init(session: SessionSummary, server: URL, apiClient: APIClient? = nil) {
@@ -42,6 +45,8 @@ final class GitWorkspaceViewModel {
         await load()
     }
 
+    /// A load cancelled while it waits (its sheet closed, or a newer retry replaced it) writes
+    /// nothing when it returns, so it never prunes choices made in a sheet opened since.
     @MainActor
     func load() async {
         guard let git else {
@@ -54,9 +59,13 @@ final class GitWorkspaceViewModel {
         lastError = nil
 
         do {
-            status = try await git.status()
+            let loaded = try await git.status()
+            guard !Task.isCancelled else { return }
+            status = loaded
             hasLoaded = true
+            progress?.prune(to: loaded, in: git.reviewScope)
         } catch {
+            guard !Task.isCancelled else { return }
             lastError = error
             errorMessage = error.localizedDescription
         }
