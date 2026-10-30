@@ -694,6 +694,25 @@ struct HermesChatTranscript: Equatable {
         return BotFilePathSearch.matches(from: reply)
     }
 
+    /// Files' workspace search (#1389) over `workspace`'s folder: the `@` panel's whole-folder
+    /// `complete.path` word, named by its folder rather than this chat's runtime. Files is pushed
+    /// over the chat, which detaches as it goes (#902), so each search joins the connection's
+    /// shared socket on a client of its own and leaves when it answers; the chat stays detached.
+    /// A search cancelled while the socket opens leaves at once, so a socket only it wanted closes.
+    func searchWorkspaceFiles(_ query: String, in workspace: HermesWorkspaceContext) async throws -> [ComposerFilePathSearch.Match] {
+        guard let http = (engine.wire as? BotClient)?.http, !Task.isCancelled else { throw BotFailure.stale }
+        let client = BotClient(http: http)
+        defer { client.close() }
+        try await withTaskCancellationHandler {
+            try await client.connect()
+        } onCancel: {
+            Task { @MainActor in client.close() }
+        }
+        let reply = try await client.call(.completeWorkspacePath(word: BotFilePathSearch.panelWord(for: query),
+                                                                 cwd: workspace.cwd, profile: workspace.profile))
+        return BotFilePathSearch.matches(from: reply, browsing: true)
+    }
+
     // MARK: Working folder (#1117)
 
     /// A new chat nothing can have run in yet: no prompt went out, no turn started and the host

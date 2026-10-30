@@ -1229,6 +1229,17 @@ panel (#1113) and Git (#1114) read the same context.
   flight, and the chat checks again in the new folder; an open panel asks again there (a
   webui switch does not reload it: that switch is optimistic). A `complete.path` with no
   reply fails only that lookup, never the chat's connection.
+- **Files search (#1389).** A Files query the `@` panel would send as `@file:name` also asks
+  that search, debounced, and lists the host's file hits (never folders) in a Workspace
+  section above the loaded tree's matches ("Open Folders"), minus paths the tree already
+  shows. Pushing Files detaches the chat (#902), so the search names the folder as `cwd`
+  instead of the chat's runtime and runs on a client of its own that joins the shared socket
+  for one reply and leaves; it never reattaches the chat. A spaced name searches like any
+  other; one-character and path-shaped queries filter the loaded tree only. The section stays
+  up while the root listing loads or fails, under its error bar and Try Again. Opening a hit
+  opens its preview without listing or expanding a folder above it. A reply that lands after
+  the `cwd` moved is stale; a failed search shows "Workspace search unavailable" with Try
+  Again, never No Matches.
 - **Git reads (#1114).** The Git menu, Changes sheet, diffs and turn-changes card read
   through `HermesGitClient`, the `GitDataClient` beside webui's `WebUIGitClient`, mapped into
   webui's Git models. Same `local` gate as Files; a folder outside a repository hides Git. It

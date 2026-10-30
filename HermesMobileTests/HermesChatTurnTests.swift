@@ -644,6 +644,72 @@ import SwiftUI
         XCTAssertFalse(chat.model.filePathSearch.isLoading)
     }
 
+    /// Files' workspace search (#1389) asks the `@` panel's whole-folder search over the chat's
+    /// folder, only once it is on a `local` backend. Pushing Files detaches the chat (#902), so
+    /// the search runs without it and leaves it detached. A query or path with a space stays,
+    /// since the host's fuzzy search takes one and Files opens rather than inserts the path.
+    func testFilesSearchesTheWholeFolderAfterTheChatDetachesForIt() async throws {
+        let chat = await openChat()
+        chat.receive(event(1, "session.info", ["cwd": .string("/work/app"), "terminal_backend": .string("docker")]))
+        XCTAssertNil(chat.model.workspaceFileSearch, "a docker folder is not on the host")
+
+        chat.receive(event(2, "session.info", ["terminal_backend": .string("local")]))
+        let search = try XCTUnwrap(chat.model.workspaceFileSearch)
+        chat.model.suspendStreamForNavigation()
+        chat.host.next("complete.path", .init(result: completions([
+            "@file:Sources/Git Diff.swift": "Sources", "@file:Tools/GitDiff.yml": "Tools"
+        ])))
+        let rows = try await search("Git Diff")
+
+        XCTAssertEqual(rows.map(\.path), ["Sources/Git Diff.swift", "Tools/GitDiff.yml"])
+        let requests = chat.writes("complete.path")
+        XCTAssertEqual(requests.count, 1)
+        let request = try XCTUnwrap(requests.first)
+        XCTAssertEqual(request["word"], .string("@file:Git Diff"))
+        XCTAssertEqual(request["cwd"], .string("/work/app"))
+        XCTAssertEqual(request["profile"], .string("default"))
+        XCTAssertTrue(chat.turn.isConnectionSuspended, "the search reattached the chat")
+    }
+
+    /// A Files search cancelled while its socket waits for `gateway.ready` ends at once and
+    /// closes the socket only it wanted, rather than holding it until the read deadline.
+    func testAFilesSearchCancelledWhileTheSocketOpensEndsAtOnce() async throws {
+        let chat = await openChat()
+        chat.receive(event(1, "session.info", ["cwd": .string("/work/app"), "terminal_backend": .string("local")]))
+        let search = try XCTUnwrap(chat.model.workspaceFileSearch)
+        chat.model.suspendStreamForNavigation()
+        let opened = expectation(description: "the search's socket opened")
+        chat.host.stallReady(opened)
+        let searching = Task { try await search("GitDiff") }
+        await fulfillment(of: [opened], timeout: 2)
+
+        searching.cancel()
+        do {
+            _ = try await searching.value
+            XCTFail("a cancelled search returned rows")
+        } catch {
+            XCTAssertEqual(error as? BotFailure, .stale, "the search waited out the stalled handshake")
+        }
+    }
+
+    /// A Files search reply that lands after the chat's folder moved is stale, never rows for
+    /// the new folder.
+    func testAFilesSearchReplyAfterTheFolderMovedIsStale() async throws {
+        let chat = await openChat()
+        chat.receive(event(1, "session.info", ["cwd": .string("/work/app"), "terminal_backend": .string("local")]))
+        let search = try XCTUnwrap(chat.model.workspaceFileSearch)
+        chat.host.next("complete.path", .init(result: completions(["@file:Sources/App.swift": "Sources"]), before: [
+            event(2, "session.info", ["cwd": .string("/work/moved")])
+        ]))
+
+        do {
+            _ = try await search("App")
+            XCTFail("the old folder's rows were returned")
+        } catch {
+            XCTAssertEqual(error as? BotFailure, .stale)
+        }
+    }
+
     /// An `@path` in the draft or a sent message becomes a chip when `complete.path` lists it;
     /// one it doesn't list stays text and is not asked about again.
     func testAnAtPathBecomesAChipOnlyWhenTheHostListsIt() async {
