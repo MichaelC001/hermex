@@ -552,6 +552,23 @@ final class APIClientWorkspaceFileTests: APIClientTestCase {
         XCTAssertNil(largeSource, "Only Markdown previews are chunked.")
     }
 
+    // MARK: - Copy Path
+
+    /// Copy Path offers exactly the workspace-relative path the tree or link named (for
+    /// every file kind; it never reads the preview), and nothing for a path that would
+    /// leak or escape the workspace.
+    func testCopyPathIsWorkspaceRelativeOnly() {
+        func copyablePath(_ path: String) -> String? {
+            FilePreviewViewModel(files: nil, path: path).copyablePath
+        }
+        XCTAssertEqual(copyablePath("docs/README.md"), "docs/README.md")
+        XCTAssertEqual(copyablePath(" README.md"), " README.md", "A filename's own spaces are part of the path.")
+        XCTAssertNil(copyablePath(" "))
+        XCTAssertNil(copyablePath("/Users/me/repo/README.md"))
+        XCTAssertNil(copyablePath("~/repo/README.md"))
+        XCTAssertNil(copyablePath("docs/../../secret.md"))
+    }
+
     @MainActor
     private func loadedMarkdownChunks(path: String, content: String) async throws -> [MarkdownPreviewChunk]? {
         let body = try JSONSerialization.data(withJSONObject: ["path": path, "content": content])

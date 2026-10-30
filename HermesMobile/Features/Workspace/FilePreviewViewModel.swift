@@ -45,6 +45,15 @@ final class FilePreviewViewModel {
         !rasterImageExtensions.contains(pathExtension(of: path)) && BinaryFilePreview(path: path) == nil
     }
 
+    /// The workspace-relative path Copy Path puts on the pasteboard; nil for an empty,
+    /// absolute, home-relative, or `..`-escaping path, so a host path is never copied.
+    var copyablePath: String? {
+        guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !path.hasPrefix("/"), !path.hasPrefix("~"),
+              !path.split(separator: "/").contains("..") else { return nil }
+        return path
+    }
+
     var canExportFile: Bool {
         files != nil && !path.isEmpty
     }
