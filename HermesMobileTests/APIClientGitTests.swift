@@ -1042,6 +1042,53 @@ extension APIClientGitTests {
         XCTAssertEqual(refusals, [.failed, .failed, .failed])
         XCTAssertEqual(HermesGitHost.writes, sent)
     }
+
+    // MARK: - Pull request (#1391)
+
+    /// The branch's pull request is asked of this host's ship-info at the repository root, from a
+    /// subfolder too, and read as its number, link and state.
+    @MainActor
+    func testAHermesPullRequestIsReadFromShipInfoAtTheRoot() async throws {
+        let git = HermesGitHost.client(cwd: HermesGitHost.repository + "/Sources") { request in
+            request.url?.path == "/api/git/review/ship-info"
+                ? HermesGitHost.shipInfo(["url": .string("https://github.com/o/r/pull/975"), "state": .string("MERGED"),
+                                          "number": .number(975)])
+                : HermesGitHost.repositoryReply(request)
+        }
+
+        let pullRequest = try await git.pullRequest()
+
+        let request = try XCTUnwrap(HermesGitHost.requests.last)
+        XCTAssertEqual(request.httpMethod, "GET")
+        XCTAssertEqual(request.url?.host(), "hermes.example")
+        XCTAssertEqual(request.url?.path, "/api/git/review/ship-info")
+        XCTAssertEqual(HermesGitHost.query(request, "path"), HermesGitHost.repository)
+        XCTAssertEqual(pullRequest, GitPullRequest(number: 975, url: URL(string: "https://github.com/o/r/pull/975")!,
+                                                   state: .merged))
+    }
+
+    /// No `gh`, no pull request, or a reply without a usable number and web link has no link to
+    /// show, rather than a bogus one; a state `gh` adds later keeps the link without a state.
+    @MainActor
+    func testAHermesPullRequestNeedsANumberAndAWebLink() async throws {
+        let link = BotJSON.string("https://github.com/o/r/pull/7")
+        let answers: [(HermesHostFixture.Reply, GitPullRequest?)] = [
+            (.json(200, .object(["ghReady": .bool(false), "pr": .null])), nil),
+            (HermesGitHost.shipInfo(["url": link, "state": .string("OPEN")]), nil),
+            (HermesGitHost.shipInfo(["url": link, "number": .number(0)]), nil),
+            (HermesGitHost.shipInfo(["url": .string("javascript:alert(1)"), "number": .number(7)]), nil),
+            (HermesGitHost.shipInfo(["url": link, "state": .string("QUEUED"), "number": .number(7)]),
+             GitPullRequest(number: 7, url: URL(string: "https://github.com/o/r/pull/7")!, state: nil)),
+        ]
+        for (reply, expected) in answers {
+            HermesHostFixture.reset()
+            let git = HermesGitHost.client { request in
+                request.url?.path == "/api/git/review/ship-info" ? reply : HermesGitHost.repositoryReply(request)
+            }
+            let pullRequest = try await git.pullRequest()
+            XCTAssertEqual(pullRequest, expected, "\(reply)")
+        }
+    }
 }
 
 /// The chat that owns a test repository's writes (`HermesGitClient.WriteOwner`): a turn is
@@ -1171,6 +1218,11 @@ enum HermesGitHost {
     /// hermex-push's `/capabilities` answer listing `routes` (#1235), or the sync routes by default.
     static func capabilities(_ routes: [String] = HermesGitClient.syncRoutes) -> HermesHostFixture.Reply {
         .json(200, .object(["plugin_version": .string("0.6.0"), "routes": .array(routes.map(BotJSON.string))]))
+    }
+
+    /// ship-info's answer with `gh` signed in and `pr` as the branch's pull request (#1391).
+    static func shipInfo(_ pr: [String: BotJSON]) -> HermesHostFixture.Reply {
+        .json(200, .object(["ghReady": .bool(true), "pr": .object(pr)]))
     }
 
     /// A request's route and query, as `/api/git/status path=/repo`.
