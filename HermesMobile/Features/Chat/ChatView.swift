@@ -24,15 +24,32 @@ private enum ActiveGitSheet: Identifiable {
     var id: Self { self }
 }
 
+/// `ChatView.turnReviewKey`: one range read per base and availability model.
+private struct TurnReviewKey: Hashable {
+    let git: GitWorkspaceAvailabilityViewModel
+    let base: GitTurnBase?
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.git === rhs.git && lhs.base == rhs.base }
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(ObjectIdentifier(git))
+        hasher.combine(base)
+    }
+}
+
 /// What the per-turn diff sheet shows (issue #316): every changed file in the turn,
-/// opened at one of them for a recap-card row tap.
+/// opened at one of them for a recap-card row tap, read in the range the card counted (#1392).
 private enum TurnDiffPresentation: Identifiable {
-    case turnFiles([GitFile], initial: GitFile?)
+    case turnFiles([GitFile], initial: GitFile?, scope: GitReviewScope)
+
+    init?(_ summary: TurnFileChangeSummary?, initial: GitFile? = nil) {
+        guard let summary, !summary.diffFiles.isEmpty else { return nil }
+        self = .turnFiles(summary.diffFiles, initial: initial, scope: summary.scope ?? .uncommitted)
+    }
 
     var id: String {
         switch self {
-        case .turnFiles(let files, let initial):
-            return "turn:" + files.map(\.id).joined(separator: "|") + ":" + (initial?.id ?? "")
+        case .turnFiles(let files, let initial, let scope):
+            return "turn:\(scope):" + files.map(\.id).joined(separator: "|") + ":" + (initial?.id ?? "")
         }
     }
 }
@@ -1405,11 +1422,12 @@ struct ChatView: View {
     @ViewBuilder
     private func turnDiffSheet(_ presentation: TurnDiffPresentation) -> some View {
         switch presentation {
-        case .turnFiles(let files, let initial):
+        case .turnFiles(let files, let initial, let scope):
             GitDiffView(
                 git: gitAvailabilityViewModel.git,
                 files: files,
                 initialFile: initial,
+                scope: scope,
                 progress: reviewProgress,
                 onAPIError: onAPIError,
                 onAddToPrompt: addDiffSelectionToDraft
@@ -1488,29 +1506,38 @@ struct ChatView: View {
 
     /// Turn-end "File changes" recap card for the latest assistant turn (#316). Only for git
     /// workspaces once the response finishes (status has refreshed) and the latest turn
-    /// actually changed files.
+    /// actually changed files. A Hermes turn whose direct send read HEAD first joins its range
+    /// since then (#1392), waiting for that read; any other joins the uncommitted status, and a
+    /// Hermes card names which.
     private var turnChangesRecapSummary: TurnFileChangeSummary? {
         guard ChatGitControlsVisibilityPolicy.showsTurnChangesRecap(
             showsGitControls: showsGitControls,
             hasRepository: gitAvailabilityViewModel.hasRepository,
             isStreaming: viewModel.activeStreamID != nil,
             latestMessageRole: latestTranscriptMessageRole
-        ) else { return nil }
+        ), let rows = gitAvailabilityViewModel.turnChangeRows(since: viewModel.hermesTurnBase) else { return nil }
         let git = gitAvailabilityViewModel.git
         let summary = TurnFileChangeAggregator.summarize(
             toolCalls: viewModel.latestTurnToolCalls,
-            status: gitAvailabilityViewModel.status,
+            files: rows.files,
+            scope: git?.isHermes == true ? rows.scope : nil,
             rowPath: { git?.rowPath(forToolPath: $0) ?? $0 }
         )
         return summary.hasChanges ? summary : nil
     }
 
-    /// Present the per-turn diff sheet for every changed file the turn has a status match
-    /// for. No-op when there is nothing diffable yet (e.g. status still refreshing).
+    /// What the latest turn's range read follows (#1392): the base an idle chat's latest turn holds,
+    /// on the repository the chat shows. Keyed on that, not on the stream ending, so a turn that
+    /// starts and ends within one update still reads, and a chat opened after its turn reads too.
+    private var turnReviewKey: TurnReviewKey {
+        TurnReviewKey(git: gitAvailabilityViewModel, base: viewModel.activeStreamID == nil ? viewModel.hermesTurnBase : nil)
+    }
+
+    /// Present the per-turn diff sheet for every changed file the turn has a row for. No-op when
+    /// there is nothing diffable yet (e.g. status still refreshing).
     private func presentTurnDiff(for summary: TurnFileChangeSummary?) {
-        let files = summary?.diffFiles ?? []
-        guard !files.isEmpty else { return }
-        turnDiffPresentation = .turnFiles(files, initial: nil)
+        guard let presentation = TurnDiffPresentation(summary) else { return }
+        turnDiffPresentation = presentation
     }
 
     /// Runs on the repository it started in: a folder change retires that one, and its outcome is
@@ -2078,7 +2105,7 @@ struct ChatView: View {
                 presentTurnDiff(for: turnChangesRecapSummary)
             },
             onOpenTurnFileDiff: { file in
-                turnDiffPresentation = .turnFiles(turnChangesRecapSummary?.diffFiles ?? [file], initial: file)
+                turnDiffPresentation = TurnDiffPresentation(turnChangesRecapSummary, initial: file)
             },
             forkOrigin: shownForkOrigin,
             onOpenForkParent: openForkParent,
@@ -2097,6 +2124,9 @@ struct ChatView: View {
         }
         .task(id: session.sessionId) {
             await resolveForkOrigin()
+        }
+        .task(id: turnReviewKey) { [turnReviewKey] in
+            await turnReviewKey.git.loadTurnReview(since: turnReviewKey.base)
         }
         .onChange(of: viewModel.messages.isEmpty, initial: true) { _, isEmpty in
             if !isEmpty { endSessionOpenSignpost() }

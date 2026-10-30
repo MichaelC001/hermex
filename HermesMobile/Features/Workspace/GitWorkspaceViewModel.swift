@@ -18,7 +18,8 @@ final class GitWorkspaceViewModel {
     /// The chat's review progress, pruned to each successful status read (`ReviewProgressStore`).
     private let progress: ReviewProgressStore?
 
-    /// The picker's selection. Each sheet opens on Uncommitted.
+    /// The picker's selection: Uncommitted or This Branch, never a turn's range. Each sheet opens
+    /// on Uncommitted.
     var scope: GitReviewScope = .uncommitted
 
     private(set) var status: GitStatus?
@@ -74,7 +75,7 @@ final class GitWorkspaceViewModel {
     func loadIfNeeded() async {
         lastError = nil
         switch scope {
-        case .uncommitted: guard !hasLoaded else { return }
+        case .uncommitted, .since: guard !hasLoaded else { return }
         case .branch: guard !hasLoadedBranch else { return }
         }
         await load()
@@ -86,7 +87,7 @@ final class GitWorkspaceViewModel {
     @MainActor
     func load() async {
         switch scope {
-        case .uncommitted: await loadStatus()
+        case .uncommitted, .since: await loadStatus()
         case .branch: await loadBranch()
         }
     }
@@ -177,6 +178,10 @@ final class GitWorkspaceAvailabilityViewModel {
     private var hasLoaded = false
     /// Set once the chat leaves this repository (`retire()`).
     private(set) var isRetired = false
+    /// The latest turn's range since the base its send read (#1392), apart from `status`, which the
+    /// toolbar and commit surfaces keep reading. Only the newest read publishes (`turnReviewRead`).
+    private var turnReview: (base: GitTurnBase, review: GitTurnReview)?
+    private var turnReviewRead = 0
 
     init(git: (any GitDataClient)?) {
         self.git = git
@@ -192,6 +197,51 @@ final class GitWorkspaceAvailabilityViewModel {
     /// and no message for a remote action), so nothing from this repository appears under the next.
     func retire() {
         isRetired = true
+    }
+
+    /// Reads the latest turn's range since `base` at turn end (#1392); nil, for a turn without
+    /// one, forgets the last. A read the chat has moved past, to another turn or folder, publishes
+    /// nothing.
+    @MainActor
+    func loadTurnReview(since base: GitTurnBase?) async {
+        turnReviewRead += 1
+        let read = turnReviewRead
+        guard let base, let git else {
+            turnReview = nil
+            return
+        }
+        turnReview = (base, .reading)
+        let review: GitTurnReview
+        do {
+            review = try await git.changes(since: base.sha).map(GitTurnReview.read) ?? .failed
+        } catch {
+            review = .failed
+        }
+        guard read == turnReviewRead, !isRetired else { return }
+        turnReview = (base, review)
+    }
+
+    /// Reads the latest turn's range again after a switch or pull here moved the tree it compares
+    /// with; nothing while no turn's range is held.
+    @MainActor
+    private func reloadTurnReview() async {
+        guard let base = turnReview?.base else { return }
+        await loadTurnReview(since: base)
+    }
+
+    /// The rows the latest turn's card joins and the range they were read in (#1392): the range
+    /// since `base` once read; the uncommitted status without a base or once that read failed; nil
+    /// while it reads, so the card shows once, under the right label.
+    @MainActor
+    func turnChangeRows(since base: GitTurnBase?) -> (files: [GitFile], scope: GitReviewScope)? {
+        let uncommitted = (files: status?.files ?? [], scope: GitReviewScope.uncommitted)
+        guard let base else { return uncommitted }
+        guard let turnReview, turnReview.base == base else { return nil }
+        switch turnReview.review {
+        case .reading: return nil
+        case .read(let files): return (files, .since(base: base.sha))
+        case .failed: return uncommitted
+        }
     }
 
     /// Whether the menu can stage, commit and push: a repository client to write through.
@@ -291,10 +341,10 @@ final class GitWorkspaceAvailabilityViewModel {
         isLoadingBranches = false
     }
 
-    /// Switches branches, then reads the status and branches again. A failed Hermes switch reads
-    /// them again too; one finishing after `retire()` has nothing to show (`.retired`). Refused,
-    /// quietly, while another write holds the repository's `GitWriteLock`, as the picker is
-    /// disabled then.
+    /// Switches branches, then reads the status, branches and the latest turn's range again. A
+    /// failed Hermes switch reads the status and branches again too; one finishing after
+    /// `retire()` has nothing to show (`.retired`). Refused, quietly, while another write holds
+    /// the repository's `GitWriteLock`, as the picker is disabled then.
     @MainActor
     func checkout(_ target: GitCheckoutTarget, stashingChanges: Bool = false) async -> GitCheckoutOutcome {
         guard let git, !isSwitchingBranch, git.writeLock?.acquire() ?? true else { return .failure }
@@ -309,10 +359,12 @@ final class GitWorkspaceAvailabilityViewModel {
             let response = try await git.checkout(target, stashingChanges: stashingChanges)
             guard !isRetired else { return .retired }
             apply(response)
+            async let turnRange: Void = reloadTurnReview()
             await refreshGitInfo()
             // Reload the branch list so the picker + composer pill reflect the new
             // current branch (a freshly created branch isn't in the cached list yet).
             await loadBranches()
+            await turnRange
             guard !isRetired else { return .retired }
             lastActionMessage = response.message
             if response.restoreFailed == true {
@@ -344,8 +396,10 @@ final class GitWorkspaceAvailabilityViewModel {
             guard !isRetired else { return false }
             status = response.status ?? status
             lastActionMessage = response.message
+            async let turnRange: Void = action == .pull ? reloadTurnReview() : ()
             await loadBranches()
             await refreshGitInfo()
+            await turnRange
             return !isRetired && response.ok != false
         } catch {
             guard !isRetired else { return false }
